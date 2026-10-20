@@ -37,21 +37,22 @@
 
 #include "axl-aipu-dmabuf.h"
 #include "axl-aipu.h"
+#include "axl-aipu-compat.h"
 #include "axl-aipu-fwtrace.h"
 #include "axl-aipu-version.h"
+
+#define AXL_USR_DMA_MAX_PAGES (1UL << 20)
 
 unsigned int enable_dmabuf_sync = 1;
 module_param(enable_dmabuf_sync, uint, 0644);
 extern unsigned int dma_timeout;
-#define MSI_DMA_WR_CH0 PMSI_DMA_RD_CH0
-#define MSI_DMA_RD_CH0 PMSI_DMA_WR_CH0
-static int axl_aipu_ch2id(int ch, int flags)
+
+static int axl_aipu_ch2id(struct axl_pcie_aipu_dev *axldev, int ch, int flags)
 {
-	if (flags & DMABUF_XFER_FLAG_READ)
-		return MSI_DMA_RD_CH0 + ch;
-	else if (flags & DMABUF_XFER_FLAG_WRITE)
-		return MSI_DMA_WR_CH0 + ch;
-	return MSI_DMA_WR_CH0 + ch;
+	int pmsi = (flags & DMABUF_XFER_FLAG_READ) ? PMSI_DMA_WR_CH0 :
+						     PMSI_DMA_RD_CH0;
+
+	return axldev->dma_msi_base + (pmsi - PMSI_DMA_RD_CH0) + ch;
 }
 
 static uint64_t axl_aipu_alloc_ctx(struct axl_pcie_aipu_dev *axldev,
@@ -74,6 +75,32 @@ static uint64_t axl_aipu_alloc_ctx(struct axl_pcie_aipu_dev *axldev,
 	return 0;
 }
 
+/*
+ * Release the buffer owned by a user-DMA work item: the DMA mapping, the
+ * sg_table built for it and the page pin.
+ */
+static void axl_aipu_usr_dma_wrk_free(struct dma_wrk *dma_wrk)
+{
+	struct pci_dev *pdev = dma_wrk->axldev->pdev;
+	struct sg_table *sgt;
+
+	sgt = dma_wrk->table;
+	if (!sgt)
+		return;
+	dma_wrk->table = NULL;
+
+	dev_dbg(&pdev->dev, "Release %lu pinned pages from dma_wrk %p\n",
+		dma_wrk->nr_pages, dma_wrk);
+
+	axl_dma_unmap_sgtable(&pdev->dev, sgt, DMA_BIDIRECTIONAL, 0);
+	sg_free_table(sgt);
+	kfree(sgt);
+	axl_unpin_user_pages(dma_wrk->page_list, dma_wrk->nr_pages,
+			     dma_wrk->dir == DMA_FROM_DEVICE);
+	kvfree(dma_wrk->page_list);
+	dma_wrk->page_list = NULL;
+}
+
 void axl_aipu_dma_wrk_release(struct kref *kref)
 {
 	struct dma_wrk *dma_wrk = container_of(kref, struct dma_wrk, refcount);
@@ -81,6 +108,9 @@ void axl_aipu_dma_wrk_release(struct kref *kref)
 	struct pci_dev *pdev = axldev->pdev;
 
 	dev_dbg(&pdev->dev, "dma_wrk %p released and freed\n", dma_wrk);
+
+	if (dma_wrk->usr_dma)
+		axl_aipu_usr_dma_wrk_free(dma_wrk);
 
 	/* Release dmabuf reference if still held */
 	if (dma_wrk->dmabuf) {
@@ -100,6 +130,7 @@ static void axl_aipu_dma_wrk_func(struct work_struct *work)
 	struct pci_dev *pdev = axldev->pdev;
 	struct sysctrl_ctx *sctx = dma_wrk->sctx;
 	const char *mode = dma_wrk->flags & DMABUF_XFER_FLAG_READ ? "WR" : "RD";
+	bool usr_dma;
 
 	if (dma_wrk->flags & DMA_XFER_FLAG_P2P)
 		axl_aipu_dma_p2p_job_submit(axldev, dma_wrk);
@@ -107,8 +138,13 @@ static void axl_aipu_dma_wrk_func(struct work_struct *work)
 		axl_aipu_dma_job_submit(axldev, dma_wrk);
 	dev_dbg(&pdev->dev, "DMA %s CH%d done (%p)\n", mode, dma_wrk->channel,
 		dma_wrk);
-	if (atomic_read(&sctx->async_dma_xfer) == ASYNC_XFER_PENDING)
-		atomic_set(&sctx->async_dma_xfer, ASYNC_XFER_DONE);
+
+	usr_dma = dma_wrk->usr_dma;
+	if (usr_dma)
+		axl_aipu_usr_dma_wrk_free(dma_wrk);
+
+	if (atomic_read(&sctx->dma_xfer_state) == DMA_XFER_PENDING)
+		atomic_set(&sctx->dma_xfer_state, DMA_XFER_DONE);
 
 	complete_all(&dma_wrk->done);
 	atomic_dec(&dma_ctrl->count);
@@ -119,6 +155,9 @@ static void axl_aipu_dma_wrk_func(struct work_struct *work)
 	/* Release sys_ctx reference */
 	dev_dbg(&pdev->dev, "Work %p releasing sys_ctx ref\n", dma_wrk);
 	kref_put(&sctx->refcount, axl_aipu_sys_ctx_release);
+
+	if (usr_dma)
+		kref_put(&dma_wrk->refcount, axl_aipu_dma_wrk_release);
 }
 
 static long sysctl_ioctl_import_attach(struct file *file, unsigned long arg)
@@ -130,10 +169,17 @@ static long sysctl_ioctl_import_attach(struct file *file, unsigned long arg)
 	struct dmabuf_imp *di = &sys_ctx->di;
 	struct dma_buf_attachment *attachment;
 	struct sg_table *table;
-	int fd;
+	int fd, ret;
 
 	if (copy_from_user(&fd, (void __user *)arg, sizeof(int)))
 		return -EFAULT;
+
+	if (atomic_read(&sys_ctx->dma_xfer_state) == DMA_XFER_PENDING) {
+		dev_err(&pdev->dev,
+			"Attach while a DMA transfer is pending (state=%d)\n",
+			atomic_read(&sys_ctx->dma_xfer_state));
+		return -EBUSY;
+	}
 
 	dev_dbg(&pdev->dev, "fd %d\n", fd);
 	dmabuf = dma_buf_get(fd);
@@ -143,15 +189,19 @@ static long sysctl_ioctl_import_attach(struct file *file, unsigned long arg)
 	attachment = dma_buf_attach(dmabuf, &axldev->pdev->dev);
 	if (IS_ERR(attachment)) {
 		dev_err(&pdev->dev, "dma_buf_attach() failed\n");
-		return PTR_ERR(attachment);
+		ret = PTR_ERR(attachment);
+		goto put_dmabuf;
 	}
 
 	table = dma_buf_map_attachment(attachment, DMA_BIDIRECTIONAL);
 	if (IS_ERR(table)) {
 		dev_err(&pdev->dev, "dma_buf_map_attachment() failed\n");
-		dma_buf_detach(dmabuf, attachment);
-		return PTR_ERR(table);
+		ret = PTR_ERR(table);
+		goto detach;
 	}
+
+	axl_aipu_sys_ctx_cleanup_dmabuf(sys_ctx);
+
 	di->attachment = attachment;
 	di->table = table;
 	di->phys = sg_dma_address(table->sgl);
@@ -159,6 +209,12 @@ static long sysctl_ioctl_import_attach(struct file *file, unsigned long arg)
 	di->dmabuf = dmabuf;
 
 	return 0;
+
+detach:
+	dma_buf_detach(dmabuf, attachment);
+put_dmabuf:
+	dma_buf_put(dmabuf);
+	return ret;
 }
 
 static long sysctl_ioctl_get_free_ctx(struct file *file, unsigned long arg)
@@ -283,39 +339,73 @@ static long sysctl_ioctl_msg_lock(struct file *file, unsigned long arg)
 			dev_err(&pdev->dev, "Int LOCK by %d\n", current->pid);
 			return -ERESTARTSYS;
 		}
-		sys_ctx->msg_flag = 1;
+		atomic_set(&sys_ctx->msg_flag, 1);
 	} else {
-		sys_ctx->msg_flag = 0;
+		if (atomic_cmpxchg(&sys_ctx->msg_flag, 1, 0) != 1) {
+			dev_warn(&pdev->dev, "UNLOCK without LOCK by %d\n",
+				 current->pid);
+			return -EPERM;
+		}
 		mutex_unlock(&axldev->msg_mutex);
 	}
 	return 0;
+}
+
+/**
+ * sysctl_ioctl_send_msg() - AXL_IOCTL_SEND_MSG: one firmware message round trip
+ * @file: Open device file
+ * @arg: User pointer to a struct sysmsg
+ *
+ * Wrapper over axl_aipu_send_msg(); only the syscall-specific parts live here.
+ *
+ * Return: 0 whenever the device answered, CMD_FAIL included - reported in
+ * sysmsg.status with the firmware's text in sysmsg.msg. Negative only for
+ * transport failures.
+ */
+static long sysctl_ioctl_send_msg(struct file *file, unsigned long arg)
+{
+	struct sysctrl_ctx *sys_ctx = file->private_data;
+	struct axl_pcie_aipu_dev *axldev = sys_ctx->axldev;
+	struct sysmsg req;
+	u32 status = 0;
+	long ret;
+
+	/* The tail is handed over as a cmd_t rather than copied into one. */
+	BUILD_BUG_ON(AXL_SYSMSG_MAX_MSG != MAX_MSG);
+	BUILD_BUG_ON(sizeof(struct cmd_t) !=
+		     sizeof(struct sysmsg) - offsetof(struct sysmsg, opcode));
+	BUILD_BUG_ON(offsetof(struct sysmsg, opcode) %
+			     __alignof__(struct cmd_t) !=
+		     0);
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	if (req.flags || req.reserved)
+		return -EINVAL;
+
+	ret = axl_aipu_send_msg(axldev, (struct cmd_t *)&req.opcode,
+				req.timeout, &status);
+
+	req.status = status;
+	if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+		return -EFAULT;
+
+	return ret;
 }
 
 static long sysctl_ioctl_detach(struct file *file, unsigned long arg)
 {
 	struct sysctrl_ctx *sys_ctx = file->private_data;
 	struct dmabuf_imp *di = &sys_ctx->di;
-	struct dma_buf *dmabuf;
-	struct dma_buf_attachment *attachment;
-	struct sg_table *table;
 
 	dev_dbg(&sys_ctx->axldev->pdev->dev, "Detach dmabuf %p\n", di->dmabuf);
-	/* Check if DMA transfer is in progress */
-	if (atomic_read(&sys_ctx->async_dma_xfer) == ASYNC_XFER_PENDING) {
+
+	if (atomic_read(&sys_ctx->dma_xfer_state) == DMA_XFER_PENDING) {
 		return -EBUSY;
 	}
 
-	dmabuf = di->dmabuf;
-	attachment = di->attachment;
-	table = di->table;
-
-	if (IS_ERR(dmabuf))
-		return PTR_ERR(dmabuf);
-
-	dma_buf_unmap_attachment(attachment, table, DMA_BIDIRECTIONAL);
-	dma_buf_detach(dmabuf, attachment);
-	dma_buf_put(dmabuf);
-	di->dmabuf = NULL;
+	axl_aipu_sys_ctx_cleanup_dmabuf(sys_ctx);
 
 	return 0;
 }
@@ -416,14 +506,20 @@ static long sysctl_ioctl_clear_poll_event(struct file *file, unsigned long arg)
 	struct pci_dev *pdev = axldev->pdev;
 	int count;
 
-	count = atomic_read(&sys_ctx->poll_event_cnt);
-	if (count > 0) {
-		atomic_dec(&sys_ctx->poll_event_cnt);
-		dev_dbg(&pdev->dev, "Consumed poll event count %d\n", count);
-		return 1; // Event consumed
-	}
+	/*
+	 * Acknowledge all pending poll notifications at once. Consumers are
+	 * level-triggered and rescan device state for all completed work on each
+	 * wakeup, so a burst of MSIs collapses to a single rescan. This is an
+	 * atomic set-to-zero rather than a userspace decrement loop on purpose:
+	 * any MSI delivered after this point re-increments the counter and
+	 * re-asserts EPOLLIN, so a clear-then-rescan consumer never loses an
+	 * event that arrives during the scan.
+	 */
+	count = atomic_xchg(&sys_ctx->poll_event_cnt, 0);
+	if (count > 0)
+		dev_dbg(&pdev->dev, "Cleared %d poll event(s)\n", count);
 
-	return 0; // No events
+	return count > 0 ? 1 : 0;
 }
 
 static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
@@ -433,44 +529,72 @@ static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
 	struct pci_dev *pdev = axldev->pdev;
 	struct dma_queue_ctrl *dma_ctrl = NULL;
 
-	struct dma_wrk *dma_wrk;
+	struct dma_wrk *dma_wrk, *old_wrk;
 	struct dma_xfer xfer;
 	struct page **page_list;
-	unsigned long nr_pages;
+	unsigned long nr_pages, nr_pinned = 0;
 	struct sg_table *sgt;
-	unsigned int pg_off;
-	int ret, i, channel, status, err;
+	unsigned int pg_off, gup_flags;
+	long pinned;
+	int ret, channel, status, err;
 	enum dma_data_direction dir;
+
+	if (axl_aipu_dev_is_unreachable(axldev)) {
+		dev_err_ratelimited(
+			&pdev->dev,
+			"device unreachable, DMA transfer rejected\n");
+		return -ENODEV;
+	}
+
+	if (atomic_read(&sys_ctx->dma_xfer_state) == DMA_XFER_PENDING) {
+		dev_err(&pdev->dev,
+			"Previous async DMA transfer not cleaned up (state=%d)\n",
+			atomic_read(&sys_ctx->dma_xfer_state));
+		return -EBUSY;
+	}
 
 	if (copy_from_user(&xfer, (void __user *)arg, sizeof(struct dma_xfer)))
 		return -EFAULT;
 
-	if ((xfer.size == 0) || (xfer.size > SIZE_MAX))
-		return -EINVAL;
+	ret = validate_usr_dma_xfer(&xfer, pdev);
+	if (ret)
+		return ret;
+
+	dir = (xfer.flags & DMABUF_XFER_FLAG_WRITE) ? DMA_TO_DEVICE :
+						      DMA_FROM_DEVICE;
+	gup_flags = (dir == DMA_FROM_DEVICE) ? FOLL_WRITE : 0;
 
 	channel = axl_aipu_find_free_dma_channel(axldev, xfer.flags);
 
 	pg_off = offset_in_page(xfer.virt);
 	nr_pages = (xfer.size + pg_off + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	page_list = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (nr_pages > AXL_USR_DMA_MAX_PAGES) {
+		dev_err(&pdev->dev,
+			"usr dma size 0x%zx too large (%lu pages)\n", xfer.size,
+			nr_pages);
+		return -EINVAL;
+	}
+
+	/* kvmalloc: a large transfer needs more than kmalloc can serve. */
+	page_list = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
 	if (!page_list)
 		return -ENOMEM;
 
-	ret = get_user_pages_fast(xfer.virt, nr_pages, 1, page_list);
-	if (ret < 0) {
-		ret = -ENOMEM;
+	pinned = axl_pin_user_pages(xfer.virt, nr_pages, gup_flags, page_list);
+	if (pinned < 0) {
+		ret = pinned;
 		goto free_page_list;
 	}
-	if (ret != nr_pages) {
-		nr_pages = ret;
+	nr_pinned = pinned;
+	if (nr_pinned != nr_pages) {
 		ret = -EFAULT;
-		goto put_pages;
+		goto unpin;
 	}
 
-	sgt = kmalloc(sizeof(*sgt), GFP_KERNEL);
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt) {
 		ret = -ENOMEM;
-		goto put_pages;
+		goto unpin;
 	}
 
 	ret = sg_alloc_table_from_pages(sgt, page_list, nr_pages, pg_off,
@@ -480,22 +604,22 @@ static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
 		goto free_sgt;
 	}
 
-	ret = dma_map_sgtable(&pdev->dev, sgt, DMA_BIDIRECTIONAL, 0);
+	ret = axl_dma_map_sgtable(&pdev->dev, sgt, DMA_BIDIRECTIONAL, 0);
 	if (ret) {
 		ret = -ENOMEM;
 		goto free_table;
 	}
 
-	dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_ATOMIC);
+	dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_ATOMIC);
 	if (!dma_wrk)
-		dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_KERNEL);
+		dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_KERNEL);
 	if (!dma_wrk) {
 		ret = -ENOMEM;
-		goto free_table;
+		goto unmap_table;
 	}
 	kref_init(&dma_wrk->refcount);
 	dma_wrk->axldev = axldev;
-	dma_wrk->id = axl_aipu_ch2id(channel, xfer.flags);
+	dma_wrk->id = axl_aipu_ch2id(axldev, channel, xfer.flags);
 	init_completion(&dma_wrk->done);
 	dma_wrk->timeout = get_timeout_ms(dma_timeout);
 	dma_wrk->axi = xfer.phy;
@@ -507,18 +631,21 @@ static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
 	dma_wrk->flags = xfer.flags;
 	dma_wrk->sctx = sys_ctx;
 	dma_wrk->dmabuf = NULL;
+	dma_wrk->usr_dma = true;
+	dma_wrk->page_list = page_list;
+	dma_wrk->nr_pages = nr_pages;
+	dma_wrk->dir = dir;
 
-	if (sys_ctx->dma_wrk)
-		kref_put(&sys_ctx->dma_wrk->refcount, axl_aipu_dma_wrk_release);
-	sys_ctx->dma_wrk = dma_wrk;
-	dma_wrk->ktime = ktime_get();
+	old_wrk = xchg(&sys_ctx->dma_wrk, dma_wrk);
+	if (old_wrk)
+		kref_put(&old_wrk->refcount, axl_aipu_dma_wrk_release);
 
 	if (xfer.flags & DMABUF_XFER_FLAG_READ) {
 		INIT_WORK(&dma_wrk->work, axl_aipu_dma_wrk_func);
 		dma_ctrl = &axldev->dma_rdqc[channel];
 		dev_dbg(&pdev->dev, "queue RD %d irq %d work (%p %p)\n",
 			channel, dma_wrk->id, dma_ctrl->wq, dma_wrk);
-	} else if (xfer.flags & DMABUF_XFER_FLAG_WRITE) {
+	} else {
 		INIT_WORK(&dma_wrk->work, axl_aipu_dma_wrk_func);
 		dma_ctrl = &axldev->dma_wrqc[channel];
 		dev_dbg(&pdev->dev, "queue WR %d irq %d work (%p %p)\n",
@@ -532,8 +659,16 @@ static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
 	dma_ctrl->size = xfer.size;
 	dma_wrk->ktime = ktime_get();
 
+	/* References for the queued work item, both dropped by the worker. */
+	kref_get(&dma_wrk->refcount);
 	kref_get(&sys_ctx->refcount);
+
+	atomic_set(&sys_ctx->dma_xfer_state, DMA_XFER_PENDING);
 	queue_work(dma_ctrl->wq, &dma_wrk->work);
+
+	if (xfer.flags & DMABUF_XFER_FLAG_ASYNC)
+		return 0;
+
 	err = wait_for_completion_timeout(&dma_wrk->done, dma_wrk->timeout);
 
 	if (err == 0) {
@@ -553,28 +688,22 @@ static long sysctl_ioctl_usr_dma_xfer(struct file *file, unsigned long arg)
 			channel, status, err);
 	}
 
-	/*
-	 * Clear pointer from sys_ctx and release our reference.
-	 * The xchg ensures only one thread releases this reference.
-	 */
-	if (xchg(&sys_ctx->dma_wrk, NULL) != NULL)
-		kref_put(&dma_wrk->refcount, axl_aipu_dma_wrk_release);
+	old_wrk = xchg(&sys_ctx->dma_wrk, NULL);
+	if (old_wrk)
+		kref_put(&old_wrk->refcount, axl_aipu_dma_wrk_release);
 
-	dma_unmap_sgtable(&pdev->dev, sgt, dir, 0);
+	return ret;
+
+unmap_table:
+	axl_dma_unmap_sgtable(&pdev->dev, sgt, DMA_BIDIRECTIONAL, 0);
 free_table:
 	sg_free_table(sgt);
 free_sgt:
 	kfree(sgt);
-put_pages:
-	for (i = 0; i < nr_pages; i++) {
-		if (page_list[i]) {
-			if (dir == DMA_TO_DEVICE)
-				set_page_dirty_lock(page_list[i]);
-			put_page(page_list[i]);
-		}
-	}
+unpin:
+	axl_unpin_user_pages(page_list, nr_pinned, false);
 free_page_list:
-	kfree(page_list);
+	kvfree(page_list);
 	return ret;
 }
 
@@ -596,11 +725,18 @@ static long sysctl_ioctl_dma_xfer(struct file *file, unsigned long arg)
 
 	struct dma_wrk *dma_wrk;
 
+	if (axl_aipu_dev_is_unreachable(axldev)) {
+		dev_err_ratelimited(
+			&pdev->dev,
+			"device unreachable, DMA transfer rejected\n");
+		return -ENODEV;
+	}
+
 	if (sys_ctx &&
-	    atomic_read(&sys_ctx->async_dma_xfer) == ASYNC_XFER_PENDING) {
+	    atomic_read(&sys_ctx->dma_xfer_state) == DMA_XFER_PENDING) {
 		dev_err(&pdev->dev,
 			"Previous async DMA transfer not cleaned up (state=%d)\n",
-			atomic_read(&sys_ctx->async_dma_xfer));
+			atomic_read(&sys_ctx->dma_xfer_state));
 		return -EBUSY;
 	}
 
@@ -620,7 +756,7 @@ static long sysctl_ioctl_dma_xfer(struct file *file, unsigned long arg)
 	if (err)
 		return err;
 
-	for_each_sgtable_dma_sg(sgt, sg, i)
+	axl_for_each_sgtable_dma_sg(sgt, sg, i)
 	{
 		unsigned int len = sg_dma_len(sg);
 		if (!len)
@@ -642,15 +778,15 @@ static long sysctl_ioctl_dma_xfer(struct file *file, unsigned long arg)
 	}
 	channel = dxfer.channel;
 
-	dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_ATOMIC);
+	dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_ATOMIC);
 	if (!dma_wrk)
-		dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_KERNEL);
+		dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_KERNEL);
 	if (!dma_wrk)
 		return -ENOMEM;
 
 	kref_init(&dma_wrk->refcount);
 	dma_wrk->axldev = axldev;
-	dma_wrk->id = axl_aipu_ch2id(channel, dxfer.flags);
+	dma_wrk->id = axl_aipu_ch2id(axldev, channel, dxfer.flags);
 	init_completion(&dma_wrk->done);
 	dma_wrk->timeout = get_timeout_ms(dma_timeout);
 	dma_wrk->axi = dxfer.phy;
@@ -707,30 +843,25 @@ static long sysctl_ioctl_dma_xfer(struct file *file, unsigned long arg)
 		di->dmabuf, dma_wrk, sys_ctx, di->table);
 
 	kref_get(&sys_ctx->refcount);
+
+	atomic_set(&sys_ctx->dma_xfer_state, DMA_XFER_PENDING);
 	queue_work(dma_ctrl->wq, &dma_wrk->work);
-	if (dxfer.flags & DMABUF_XFER_FLAG_SYNC) {
-		err = wait_for_completion_timeout(&dma_wrk->done,
-						  dma_wrk->timeout);
-		if (err == 0) {
-			dev_err(&pdev->dev,
-				"DMA %s CH%d queue timeout (%p status %d)\n",
-				dxfer.flags & DMABUF_XFER_FLAG_WRITE ? "WR" :
-								       "RD",
-				channel, dma_wrk, dma_wrk->status);
-			flush_work(&dma_wrk->work);
-			dma_ctrl->num_err++;
-			err = -ETIMEDOUT;
-		}
-		status = dma_wrk->status;
-		return err > 0 ? status : err;
-	}
 
-	if (dxfer.flags & DMABUF_XFER_FLAG_ASYNC) {
-		atomic_set(&sys_ctx->async_dma_xfer, ASYNC_XFER_PENDING);
+	if (dxfer.flags & DMABUF_XFER_FLAG_ASYNC)
 		return 0;
-	}
 
-	return err > 0 ? dma_wrk->status : err;
+	err = wait_for_completion_timeout(&dma_wrk->done, dma_wrk->timeout);
+	if (err == 0) {
+		dev_err(&pdev->dev,
+			"DMA %s CH%d queue timeout (%p status %d)\n",
+			dxfer.flags & DMABUF_XFER_FLAG_WRITE ? "WR" : "RD",
+			channel, dma_wrk, dma_wrk->status);
+		flush_work(&dma_wrk->work);
+		dma_ctrl->num_err++;
+		err = -ETIMEDOUT;
+	}
+	status = dma_wrk->status;
+	return err > 0 ? status : err;
 }
 
 static long sysctl_ioctl_dma_p2p_xfer(struct file *file, unsigned long arg)
@@ -744,11 +875,18 @@ static long sysctl_ioctl_dma_p2p_xfer(struct file *file, unsigned long arg)
 	int err, channel, status, max_dma_ch = axldev->dev_info->dma_rd_ch;
 	struct dma_wrk *dma_wrk;
 
+	if (axl_aipu_dev_is_unreachable(axldev)) {
+		dev_err_ratelimited(
+			&pdev->dev,
+			"device unreachable, DMA transfer rejected\n");
+		return -ENODEV;
+	}
+
 	if (sys_ctx &&
-	    atomic_read(&sys_ctx->async_dma_xfer) == ASYNC_XFER_PENDING) {
+	    atomic_read(&sys_ctx->dma_xfer_state) == DMA_XFER_PENDING) {
 		dev_err(&pdev->dev,
 			"Previous async DMA transfer not cleaned up (state=%d)\n",
-			atomic_read(&sys_ctx->async_dma_xfer));
+			atomic_read(&sys_ctx->dma_xfer_state));
 		return -EBUSY;
 	}
 
@@ -764,15 +902,15 @@ static long sysctl_ioctl_dma_p2p_xfer(struct file *file, unsigned long arg)
 	}
 	channel = xfer.channel;
 
-	dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_ATOMIC);
+	dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_ATOMIC);
 	if (!dma_wrk)
-		dma_wrk = kmalloc(sizeof(*dma_wrk), GFP_KERNEL);
+		dma_wrk = kzalloc(sizeof(*dma_wrk), GFP_KERNEL);
 	if (!dma_wrk)
 		return -ENOMEM;
 
 	kref_init(&dma_wrk->refcount);
 	dma_wrk->axldev = axldev;
-	dma_wrk->id = axl_aipu_ch2id(channel, xfer.flags);
+	dma_wrk->id = axl_aipu_ch2id(axldev, channel, xfer.flags);
 	init_completion(&dma_wrk->done);
 	dma_wrk->timeout = get_timeout_ms(dma_timeout);
 	dma_wrk->axi = xfer.axi;
@@ -807,30 +945,26 @@ static long sysctl_ioctl_dma_p2p_xfer(struct file *file, unsigned long arg)
 	dma_wrk->ktime = ktime_get();
 
 	kref_get(&sys_ctx->refcount);
+
+	/* PENDING for sync as well as async -- see sysctl_ioctl_dma_xfer(). */
+	atomic_set(&sys_ctx->dma_xfer_state, DMA_XFER_PENDING);
 	queue_work(dma_ctrl->wq, &dma_wrk->work);
-	if (xfer.flags & DMABUF_XFER_FLAG_SYNC) {
-		err = wait_for_completion_timeout(&dma_wrk->done,
-						  dma_wrk->timeout);
-		if (err == 0) {
-			dev_err(&pdev->dev,
-				"DMA %s CH%d queue timeout (%p status %d)\n",
-				xfer.flags & DMABUF_XFER_FLAG_WRITE ? "WR" :
-								      "RD",
-				channel, dma_wrk, dma_wrk->status);
-			flush_work(&dma_wrk->work);
-			dma_ctrl->num_err++;
-			err = -ETIMEDOUT;
-		}
-		status = dma_wrk->status;
-		return err > 0 ? status : err;
-	}
 
-	if (xfer.flags & DMABUF_XFER_FLAG_ASYNC) {
-		atomic_set(&sys_ctx->async_dma_xfer, ASYNC_XFER_PENDING);
+	if (xfer.flags & DMABUF_XFER_FLAG_ASYNC)
 		return 0;
-	}
 
-	return err > 0 ? dma_wrk->status : err;
+	err = wait_for_completion_timeout(&dma_wrk->done, dma_wrk->timeout);
+	if (err == 0) {
+		dev_err(&pdev->dev,
+			"DMA %s CH%d queue timeout (%p status %d)\n",
+			xfer.flags & DMABUF_XFER_FLAG_WRITE ? "WR" : "RD",
+			channel, dma_wrk, dma_wrk->status);
+		flush_work(&dma_wrk->work);
+		dma_ctrl->num_err++;
+		err = -ETIMEDOUT;
+	}
+	status = dma_wrk->status;
+	return err > 0 ? status : err;
 }
 
 static long sysctl_ioctl_get_user_pa(struct file *file, unsigned long arg)
@@ -892,15 +1026,15 @@ static long sysctl_ioctl_dma_get_xfer_sync_status(struct file *file,
 		return -EFAULT;
 
 	dev_dbg(&pdev->dev, "sys_ctx %p work %p sync_dma_xfer %d\n", sys_ctx,
-		sys_ctx->dma_wrk, atomic_read(&sys_ctx->async_dma_xfer));
+		sys_ctx->dma_wrk, atomic_read(&sys_ctx->dma_xfer_state));
 
 	if (!(dxfer.flags & DMABUF_XFER_FLAG_SYNC)) {
 		dev_err(&pdev->dev, "Invalid flags %d\n", dxfer.flags);
 		return -EINVAL;
 	}
-	if (!atomic_read(&sys_ctx->async_dma_xfer)) {
-		dev_err(&pdev->dev, "Invalid async_dma_xfer %d\n",
-			atomic_read(&sys_ctx->async_dma_xfer));
+	if (!atomic_read(&sys_ctx->dma_xfer_state)) {
+		dev_err(&pdev->dev, "Invalid dma_xfer_state %d\n",
+			atomic_read(&sys_ctx->dma_xfer_state));
 		return -EINVAL;
 	}
 
@@ -931,9 +1065,9 @@ static long sysctl_ioctl_dma_get_xfer_async_status(struct file *file,
 	struct axl_pcie_aipu_dev *axldev = sys_ctx->axldev;
 	struct pci_dev *pdev = axldev->pdev;
 
-	dev_dbg(&pdev->dev, "sys_ctx %p work %p async_dma_xfer %d\n", sys_ctx,
-		sys_ctx->dma_wrk, atomic_read(&sys_ctx->async_dma_xfer));
-	return atomic_read(&sys_ctx->async_dma_xfer);
+	dev_dbg(&pdev->dev, "sys_ctx %p work %p dma_xfer_state %d\n", sys_ctx,
+		sys_ctx->dma_wrk, atomic_read(&sys_ctx->dma_xfer_state));
+	return atomic_read(&sys_ctx->dma_xfer_state);
 }
 
 static long sysctl_ioctl_get_dma_stats(struct file *file, unsigned long arg)
@@ -1046,6 +1180,7 @@ long sysctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	long ret = 0;
 	switch (cmd) {
 	case AXL_IOCTL_MSG_LOCK: ret = sysctl_ioctl_msg_lock(file, arg); break;
+	case AXL_IOCTL_SEND_MSG: ret = sysctl_ioctl_send_msg(file, arg); break;
 	case AXL_IOCTL_CTX_ALLOC:
 		ret = sysctl_ioctl_ctx_alloc(file, arg);
 		break;

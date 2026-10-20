@@ -40,7 +40,6 @@
 #include "axl-aipu-edma-core.h"
 
 /* Module params */
-extern unsigned int dma_poll;
 extern unsigned int enable_dmabuf_sync;
 extern unsigned int enable_sg_host_dma;
 
@@ -172,8 +171,8 @@ static void axl_aipu_edma_enable_ctrl(struct axl_pcie_aipu_dev *axldev)
 {
 	struct dw_edma_v0_regs *edma = axldev->dma;
 
-	edma->wr_engine_en = 1;
-	edma->rd_engine_en = 1;
+	writel(1, &edma->wr_engine_en);
+	writel(1, &edma->rd_engine_en);
 }
 
 static void axl_aipu_edma_init_imwr(struct axl_pcie_aipu_dev *axldev)
@@ -183,29 +182,33 @@ static void axl_aipu_edma_init_imwr(struct axl_pcie_aipu_dev *axldev)
 	if (axldev->dma_vm)
 		return;
 
-	edma->wr_done_imwr.lsb = axldev->irq_msi.address_lo;
-	edma->wr_done_imwr.msb = axldev->irq_msi.address_hi;
-	edma->wr_abort_imwr.lsb = axldev->irq_msi.address_lo;
-	edma->wr_abort_imwr.msb = axldev->irq_msi.address_hi;
+	writel(axldev->irq_msi.address_lo, &edma->wr_done_imwr.lsb);
+	writel(axldev->irq_msi.address_hi, &edma->wr_done_imwr.msb);
+	writel(axldev->irq_msi.address_lo, &edma->wr_abort_imwr.lsb);
+	writel(axldev->irq_msi.address_hi, &edma->wr_abort_imwr.msb);
 
-	edma->rd_done_imwr.lsb = axldev->irq_msi.address_lo;
-	edma->rd_done_imwr.msb = axldev->irq_msi.address_hi;
-	edma->rd_abort_imwr.lsb = axldev->irq_msi.address_lo;
-	edma->rd_abort_imwr.msb = axldev->irq_msi.address_hi;
+	writel(axldev->irq_msi.address_lo, &edma->rd_done_imwr.lsb);
+	writel(axldev->irq_msi.address_hi, &edma->rd_done_imwr.msb);
+	writel(axldev->irq_msi.address_lo, &edma->rd_abort_imwr.lsb);
+	writel(axldev->irq_msi.address_hi, &edma->rd_abort_imwr.msb);
 
 	if (axldev->nmsi == 1) {
 		u32 imwr_data = axldev->irq_msi.data;
-		edma->wr_ch01_imwr_data = imwr_data | (imwr_data << 16);
-		edma->wr_ch23_imwr_data = imwr_data | (imwr_data << 16);
-		edma->rd_ch01_imwr_data = imwr_data | (imwr_data << 16);
-		edma->rd_ch23_imwr_data = imwr_data | (imwr_data << 16);
+		writel(imwr_data | (imwr_data << 16), &edma->wr_ch01_imwr_data);
+		writel(imwr_data | (imwr_data << 16), &edma->wr_ch23_imwr_data);
+		writel(imwr_data | (imwr_data << 16), &edma->rd_ch01_imwr_data);
+		writel(imwr_data | (imwr_data << 16), &edma->rd_ch23_imwr_data);
 		return;
 	}
 
-	edma->rd_ch01_imwr_data = PMSI_METIS_RD_CH0 | (PMSI_METIS_RD_CH1 << 16);
-	edma->rd_ch23_imwr_data = PMSI_METIS_RD_CH2 | (PMSI_METIS_RD_CH3 << 16);
-	edma->wr_ch01_imwr_data = PMSI_METIS_WR_CH0 | (PMSI_METIS_WR_CH1 << 16);
-	edma->wr_ch23_imwr_data = PMSI_METIS_WR_CH2 | (PMSI_METIS_WR_CH3 << 16);
+	writel(PMSI_METIS_RD_CH0 | (PMSI_METIS_RD_CH1 << 16),
+	       &edma->rd_ch01_imwr_data);
+	writel(PMSI_METIS_RD_CH2 | (PMSI_METIS_RD_CH3 << 16),
+	       &edma->rd_ch23_imwr_data);
+	writel(PMSI_METIS_WR_CH0 | (PMSI_METIS_WR_CH1 << 16),
+	       &edma->wr_ch01_imwr_data);
+	writel(PMSI_METIS_WR_CH2 | (PMSI_METIS_WR_CH3 << 16),
+	       &edma->wr_ch23_imwr_data);
 }
 
 static void axl_aipu_edma_align_imwr(struct axl_pcie_aipu_dev *axldev)
@@ -221,13 +224,14 @@ static void axl_aipu_edma_align_imwr(struct axl_pcie_aipu_dev *axldev)
 		return;
 
 	imwr_data = axldev->irq_msi.data;
-	edma->wr_ch01_imwr_data = imwr_data | (imwr_data << 16);
-	edma->wr_ch23_imwr_data = imwr_data | (imwr_data << 16);
-	edma->rd_ch01_imwr_data = imwr_data | (imwr_data << 16);
-	edma->rd_ch23_imwr_data = imwr_data | (imwr_data << 16);
+	writel(imwr_data | (imwr_data << 16), &edma->wr_ch01_imwr_data);
+	writel(imwr_data | (imwr_data << 16), &edma->wr_ch23_imwr_data);
+	writel(imwr_data | (imwr_data << 16), &edma->rd_ch01_imwr_data);
+	writel(imwr_data | (imwr_data << 16), &edma->rd_ch23_imwr_data);
 }
 
 #define DMA_START_TIMEOUT 100000
+#define DMA_POLL_SPINS	  1000
 static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 			       struct dma_wrk *dma_wrk)
 {
@@ -237,6 +241,8 @@ static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 	int err;
 	__u32 ctrl;
 	u32 timeout = DMA_START_TIMEOUT;
+	unsigned long deadline;
+	u32 spins = 0;
 	const char *mode = dma_wrk->flags & DMABUF_XFER_FLAG_READ ? "WR" : "RD";
 
 	enum dw_edma_dir dir = dma_wrk->flags & DMABUF_XFER_FLAG_READ ?
@@ -247,16 +253,22 @@ static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 	dev_dbg(&pdev->dev, "DMA %s CH%d (irq %d, ctrl 0x%x)\n", mode,
 		dma_wrk->channel, dma_wrk->id, DW_EDMA_CTRL_CS(ctrl));
 	SET_RW_32(edma, dir, doorbell, dma_wrk->channel);
+	deadline = jiffies + msecs_to_jiffies(dma_timeout * MSEC_PER_SEC);
 	do {
 		ctrl = GET_RW_32_CH(edma, dir, ch_control1, dma_wrk->channel);
+		if (ctrl == U32_MAX)
+			return axl_aipu_dma_dev_gone(axldev, dma_wrk);
 		if (DW_EDMA_CTRL_CS(ctrl) == 0)
 			SET_RW_32(edma, dir, doorbell, dma_wrk->channel);
 
 		if (DW_EDMA_CTRL_CS(ctrl) == DW_EDMA_V0_CS_HALT)
 			break;
-		if (!--timeout)
+		if (!--timeout || time_after(jiffies, deadline))
 			break;
-		udelay(10);
+		if (++spins < DMA_POLL_SPINS)
+			udelay(10);
+		else
+			usleep_range(50, 100);
 	} while (!DW_EDMA_CTRL_CS(ctrl));
 	err = wait_for_completion_timeout(
 		&axldev->irq_wrk[dma_wrk->id].irq_done,
@@ -266,7 +278,7 @@ static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 		dev_err(&pdev->dev, "DMA %s CH%d timeout (irq %d)\n", mode,
 			dma_wrk->channel, dma_wrk->id);
 		dma_wrk->status = -ETIMEDOUT;
-		sctx_set_async_dma_xfer(sctx, ASYNC_XFER_TIMEOUT);
+		sctx_set_dma_xfer_state(sctx, DMA_XFER_TIMEOUT);
 		dma_wrk->qctrl->num_err++;
 		return -1;
 	}
@@ -277,7 +289,7 @@ static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 				"DMA %s CH%d spurious wakeup (irq %d)\n", mode,
 				dma_wrk->channel, dma_wrk->id);
 			dma_wrk->status = -EIO;
-			sctx_set_async_dma_xfer(sctx, ASYNC_XFER_FAIL);
+			sctx_set_dma_xfer_state(sctx, DMA_XFER_FAIL);
 			dma_wrk->qctrl->num_err++;
 			return -1;
 		}
@@ -287,7 +299,7 @@ static inline int dma_wait_irq(struct axl_pcie_aipu_dev *axldev,
 			dev_err(&pdev->dev, "DMA error %s CH%d (ctrl 0x%x)\n",
 				mode, dma_wrk->channel, DW_EDMA_CTRL_CS(ctrl));
 			dma_wrk->status = -EIO;
-			sctx_set_async_dma_xfer(sctx, ASYNC_XFER_FAIL);
+			sctx_set_dma_xfer_state(sctx, DMA_XFER_FAIL);
 			dma_wrk->qctrl->num_err++;
 			return -1;
 		}
@@ -303,6 +315,8 @@ static inline int dma_wait_poll(struct axl_pcie_aipu_dev *axldev,
 	struct pci_dev *pdev = axldev->pdev;
 	struct sysctrl_ctx *sctx = dma_wrk->sctx;
 	u32 timeout = DMA_POLL_TIMEOUT;
+	unsigned long deadline;
+	u32 spins = 0;
 	__u32 ctrl;
 	const char *mode = dma_wrk->flags & DMABUF_XFER_FLAG_READ ? "WR" : "RD";
 
@@ -313,25 +327,35 @@ static inline int dma_wait_poll(struct axl_pcie_aipu_dev *axldev,
 	ctrl = GET_RW_32_CH(edma, dir, ch_control1, dma_wrk->channel);
 	dev_dbg(&pdev->dev, "DMA %s CH%d (irq %d, ctrl 0x%x)\n", mode,
 		dma_wrk->channel, dma_wrk->id, DW_EDMA_CTRL_CS(ctrl));
+	deadline = jiffies + msecs_to_jiffies(dma_timeout * MSEC_PER_SEC);
 	do {
 		ctrl = GET_RW_32_CH(edma, dir, ch_control1, dma_wrk->channel);
+		if (ctrl == U32_MAX)
+			return axl_aipu_dma_dev_gone(axldev, dma_wrk);
 		if (DW_EDMA_CTRL_CS(ctrl) == 0)
 			SET_RW_32(edma, dir, doorbell, dma_wrk->channel);
 
 		if (DW_EDMA_CTRL_CS(ctrl) == DW_EDMA_V0_CS_HALT)
 			break;
-		if (!--timeout)
+		if (!--timeout || time_after(jiffies, deadline)) {
+			timeout = 0;
 			break;
-		udelay(10);
+		}
+		if (++spins < DMA_POLL_SPINS)
+			udelay(10);
+		else
+			usleep_range(50, 100);
 	} while (DW_EDMA_CTRL_CS(ctrl) != DW_EDMA_V0_CS_STOP);
 	dev_dbg(&pdev->dev, "DMA %s CH%d  timeout %d (irq %d, ctrl 0x%x)\n",
 		mode, dma_wrk->channel, timeout, dma_wrk->id,
 		DW_EDMA_CTRL_CS(ctrl));
 
 	ctrl = GET_RW_32_CH(edma, dir, ch_control1, dma_wrk->channel);
+	if (ctrl == U32_MAX)
+		return axl_aipu_dma_dev_gone(axldev, dma_wrk);
 	if ((DW_EDMA_CTRL_CS(ctrl) != DW_EDMA_V0_CS_STOP) && !timeout) {
 		dma_wrk->status = -ETIMEDOUT;
-		sctx_set_async_dma_xfer(sctx, ASYNC_XFER_TIMEOUT);
+		sctx_set_dma_xfer_state(sctx, DMA_XFER_TIMEOUT);
 		dma_wrk->qctrl->num_err++;
 		return -1;
 	}
@@ -339,7 +363,7 @@ static inline int dma_wait_poll(struct axl_pcie_aipu_dev *axldev,
 		dev_err(&pdev->dev, "DMA Poll error %s CH%d (ctrl 0x%x %d)\n",
 			mode, dma_wrk->channel, DW_EDMA_CTRL_CS(ctrl), timeout);
 		dma_wrk->status = -EIO;
-		sctx_set_async_dma_xfer(sctx, ASYNC_XFER_FAIL);
+		sctx_set_dma_xfer_state(sctx, DMA_XFER_FAIL);
 		dma_wrk->qctrl->num_err++;
 		return -1;
 	}
@@ -348,7 +372,7 @@ static inline int dma_wait_poll(struct axl_pcie_aipu_dev *axldev,
 static inline int dma_wait(struct axl_pcie_aipu_dev *axldev,
 			   struct dma_wrk *dma_wrk)
 {
-	if (dma_poll)
+	if (dma_poll_mode(dma_wrk))
 		return dma_wait_poll(axldev, dma_wrk);
 
 	return dma_wait_irq(axldev, dma_wrk);
@@ -414,7 +438,7 @@ static int edma_transfer_descriptors(struct dma_wrk *dma_wrk, int channel,
 	SET_RW_32_CH(edma, dir, transfer_size, channel, desc_size);
 
 	/* Enable interrupt if not in polling mode */
-	if (!dma_poll) {
+	if (!dma_poll_mode(dma_wrk)) {
 		SET_RW_32_CH(edma, dir, ch_control1, channel, DW_EDMA_V0_RIE);
 		atomic_set(&axldev->irq_wrk[irq_id].dma_done, 0);
 		reinit_completion(&axldev->irq_wrk[irq_id].irq_done);
@@ -449,11 +473,23 @@ static int edma_transfer_descriptors(struct dma_wrk *dma_wrk, int channel,
 		channel, DW_EDMA_CTRL_CS(ctrl));
 
 	/* Wait for completion using interrupt or polling */
-	if (dma_poll) {
+	if (dma_poll_mode(dma_wrk)) {
 		/* Polling mode */
 		u32 timeout = DMA_POLL_TIMEOUT;
+		unsigned long deadline =
+			jiffies + msecs_to_jiffies(dma_timeout * MSEC_PER_SEC);
+		u32 spins = 0;
+
 		do {
 			ctrl = GET_RW_32_CH(edma, dir, ch_control1, channel);
+			if (ctrl == U32_MAX) {
+				dev_err(&pdev->dev,
+					"Descriptor transfer: device not responding\n");
+				axl_aipu_dev_problem(
+					axldev, "DMA descriptor register read");
+				ret = -EIO;
+				goto edma_release_lock;
+			}
 			if (DW_EDMA_CTRL_CS(ctrl) == DW_EDMA_V0_CS_HALT) {
 				dev_err(&pdev->dev,
 					"Descriptor transfer halted unexpectedly (ctrl=0x%x)\n",
@@ -461,14 +497,17 @@ static int edma_transfer_descriptors(struct dma_wrk *dma_wrk, int channel,
 				ret = -EIO;
 				goto edma_release_lock;
 			}
-			if (--timeout == 0) {
+			if (--timeout == 0 || time_after(jiffies, deadline)) {
 				dev_err(&pdev->dev,
 					"Descriptor transfer timeout (ctrl=0x%x)\n",
 					DW_EDMA_CTRL_CS(ctrl));
 				ret = -ETIMEDOUT;
 				goto edma_release_lock;
 			}
-			udelay(10);
+			if (++spins < DMA_POLL_SPINS)
+				udelay(10);
+			else
+				usleep_range(50, 100);
 		} while (DW_EDMA_CTRL_CS(ctrl) != DW_EDMA_V0_CS_STOP);
 	} else {
 		/* Interrupt mode */
@@ -610,7 +649,7 @@ static void axl_aipu_edma_sgdev_dma_job(struct dma_wrk *dma_wrk)
 			}
 			i++;
 		}
-		if (!dma_poll) {
+		if (!dma_poll_mode(dma_wrk)) {
 			LL_SET_RW_32_CH(lldch, dir, channel, i - 1, control,
 					DW_EDMA_V0_CB | DW_EDMA_V0_RIE);
 		} else {
@@ -630,7 +669,7 @@ static void axl_aipu_edma_sgdev_dma_job(struct dma_wrk *dma_wrk)
 		LL_SET_RW_32_CH(lldch, dir, channel, i + 1, control, 0);
 		mb();
 		LL_GET_RW_32_CH(lldch, dir, channel, i, control);
-		if (!dma_poll) {
+		if (!dma_poll_mode(dma_wrk)) {
 			atomic_set(&axldev->irq_wrk[dma_wrk->id].dma_done, 0);
 			reinit_completion(
 				&axldev->irq_wrk[dma_wrk->id].irq_done);
@@ -756,7 +795,7 @@ static void axl_aipu_edma_sghost_dma_job(struct dma_wrk *dma_wrk)
 			i++;
 		}
 		/* Set interrupt enable on last descriptor (host memory) */
-		if (!dma_poll) {
+		if (!dma_poll_mode(dma_wrk)) {
 			LL_SET_RW_32_HOST(lldch, dir, channel, i - 1, control,
 					  DW_EDMA_V0_CB | DW_EDMA_V0_RIE);
 		} else {
@@ -811,7 +850,7 @@ static void axl_aipu_edma_sghost_dma_job(struct dma_wrk *dma_wrk)
 			channel, (u64)axl_aipu_edma_get_ll_desc_base(axldev),
 			__get_ll_base(hwlldch, dir, channel));
 
-		if (!dma_poll) {
+		if (!dma_poll_mode(dma_wrk)) {
 			atomic_set(&axldev->irq_wrk[dma_wrk->id].dma_done, 0);
 			reinit_completion(
 				&axldev->irq_wrk[dma_wrk->id].irq_done);
@@ -866,7 +905,7 @@ static void axl_aipu_edma_dma_p2p_job(struct dma_wrk *dma_wrk)
 		dma_wrk->channel, dma_wrk);
 	SET_RW_32_CH(edma, dir, transfer_size, channel, dma_wrk->size);
 	SET_RW_32_CH(edma, dir, ch_control1, channel,
-		     !dma_poll ? DW_EDMA_V0_RIE : 0);
+		     !dma_poll_mode(dma_wrk) ? DW_EDMA_V0_RIE : 0);
 
 	if (dir == DW_EDMA_DIR_WRITE) {
 		SET_RW_32_CH(edma, dir, sar.lsb, channel, _LSB(axi));
@@ -887,7 +926,7 @@ static void axl_aipu_edma_dma_p2p_job(struct dma_wrk *dma_wrk)
 		GET_RW_32_CH(edma, dir, sar.lsb, channel),
 		GET_RW_32_CH(edma, dir, dar.msb, channel),
 		GET_RW_32_CH(edma, dir, dar.lsb, channel));
-	if (!dma_poll) {
+	if (!dma_poll_mode(dma_wrk)) {
 		atomic_set(&axldev->irq_wrk[dma_wrk->id].dma_done, 0);
 		reinit_completion(&axldev->irq_wrk[dma_wrk->id].irq_done);
 	}

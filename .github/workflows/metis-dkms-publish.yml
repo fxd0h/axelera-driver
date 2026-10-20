@@ -1,0 +1,104 @@
+---
+name: Publish metis-dkms package
+
+# Reference itself in `paths` to be able to test-run changes
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - axl-aipu-version.h
+      - .github/workflows/metis-dkms-publish.yml
+  push:
+    branches:
+      - main
+      - hotfix/*
+
+
+concurrency:
+  group: metis-dkms-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-builds:
+    name: Build and publish metis-dkms.deb
+    runs-on:
+      group: "production-AWS-CPU-X86_64-EKS"
+      labels: "production-scale-set-x64-4-16"
+    env:
+      # Kernel the dkms build dry-run compiles against.
+      # Same as SP U24.04 container
+      KVER: 6.14.0-27-generic
+      JF_URL: 'https://artifactory.production.aws.axelera.ai'
+    steps:
+      - name: Checkout pcie-driver repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          token: ${{ secrets.CI_PAT }}
+
+      - name: Execute keyscan for repo servers
+        run: |
+          [[ -e ~/.ssh/known_hosts ]] && ssh-keygen -R github.com || true
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@d4fffb50872869abe2d9a9098a6d9c5aa7d16be4 # v2.7.0
+        with:
+          key: ${{ secrets.CI_SSH_PRIVATE_KEY }}
+          known_hosts: ${{ secrets.CI_KNOWN_HOSTS }}
+          if_key_exists: replace
+
+      - name: Install build dependencies
+        run: .github/workflows/scripts/ci.dependencies.sh
+
+      - name: Configure and build metis-dkms Debian package
+        id: build
+        run: |
+          cmake -S dkms -B build/metis-dkms -DDEFAULT_KERNEL="${KVER}"
+          cmake --build build/metis-dkms --target metis-dkms-deb-pkg
+
+          # The .deb is produced next to the CMake binary dir (see dkms CMakeLists)
+          DEB_PKG=$(cd build/metis-dkms && ls metis-dkms_*_all.deb | head -n1)
+          if [ -z "$DEB_PKG" ]; then
+            echo "metis-dkms .deb not found" >&2
+            exit 1
+          fi
+          echo "deb_pkg=$DEB_PKG" >> "$GITHUB_OUTPUT"
+          echo "deb_dir=$PWD/build/metis-dkms" >> "$GITHUB_OUTPUT"
+          echo "Built package: $DEB_PKG"
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@e5d3afdd1d75e4aa14a4f217cca93a2a9b5b846d # v4.8.0
+        env:
+          JF_URL: ${{ env.JF_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Publish metis-dkms package to Artifactory
+        working-directory: ${{ steps.build.outputs.deb_dir }}
+        env:
+          JFROG_CLI_BUILD_NAME: metis-dkms
+          JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          DEB_PKG="${{ steps.build.outputs.deb_pkg }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            RT_PROJECT="VOYAGER"
+            DEB_REPO="axelera-apt-source"
+          else
+            RT_PROJECT="SW CI Development"
+            DEB_REPO="swci-axelera-ubuntu-repo"
+          fi
+
+          # We duplicate ubuntu22 and ubuntu24 for the moment to not break SDK install documentation
+          for DIST in ubuntu22 ubuntu24; do
+            if jf rt search "${DEB_REPO}/metis-dkms/${DIST}/${DEB_PKG}" | grep -q '"path"'; then
+              echo "::warning::${DEB_PKG} already exists in ${DEB_REPO}/metis-dkms/${DIST} - overwriting"
+            fi
+
+            jf rt upload \
+              --project "$RT_PROJECT" \
+              --deb "${DIST}/main/all" \
+              --build-name "$JFROG_CLI_BUILD_NAME" \
+              --build-number "$JFROG_CLI_BUILD_NUMBER" \
+              "$DEB_PKG" \
+              "${DEB_REPO}/metis-dkms/${DIST}/${DEB_PKG}"
+          done

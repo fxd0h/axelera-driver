@@ -197,6 +197,44 @@ Check kernel logs for errors:
 dmesg | tail -n 50
 ```
 
+### Device does not appear: `Fail to dma alloc 400000`
+
+The driver reserves a 4 MB physically contiguous coherent buffer per device for
+virtual MSI delivery. If that allocation fails, probe aborts with `-ENOMEM` and
+the device is not registered: the module loads, but no `/dev/metis-*` node is
+created.
+
+```bash
+sudo dmesg | grep "Fail to dma alloc"
+# axl 0000:01:00.0: Fail to dma alloc 400000
+```
+
+4 MB is the largest single block the kernel allocator can serve, so it is the
+first to fail once physical memory fragments. This typically shows up on hosts
+with long uptime, or after repeated driver unload/reload cycles. Check the
+order-10 column (the rightmost) of:
+
+```bash
+cat /proc/buddyinfo
+```
+
+To recover, compact memory and reload the driver:
+
+```bash
+echo 1 | sudo tee /proc/sys/vm/compact_memory
+sudo modprobe -r metis && sudo modprobe metis
+```
+
+Then confirm the device came up before running a workload:
+
+```bash
+ls /dev/metis-*
+```
+
+On hosts that reload the driver frequently, run the `compact_memory` step before
+each load. If compaction is not enough, reboot: high-order free lists are
+restored at boot.
+
 ### Build fails with missing headers
 
 Ensure kernel headers match your running kernel version:

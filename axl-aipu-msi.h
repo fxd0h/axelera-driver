@@ -28,24 +28,11 @@ struct axl_pcie_aipu_dev;
  * axl_aipu_register_msi_fops() - Register MSI function pointers
  * @axldev: Device context
  *
- * Registers VMSI handlers with trigger group mapping.
+ * Registers the VMSI handlers for every generation: the trigger map is used
+ * when firmware publishes one, and the 1:1 mapping - all Metis ever uses -
+ * otherwise.
  */
 void axl_aipu_register_msi_fops(struct axl_pcie_aipu_dev *axldev);
-
-/**
- * axl_aipu_register_msi_metis_fops() - Register Metis MSI function pointers
- * @axldev: Device context
- *
- * Registers MSI/VMSI handlers without trigger config.
- */
-void axl_aipu_register_msi_metis_fops(struct axl_pcie_aipu_dev *axldev);
-
-/**
- * irq_poll_check() - Wake up poll waiters for MSI
- * @axldev: Device context
- * @msi: MSI/VMSI index
- */
-void irq_poll_check(struct axl_pcie_aipu_dev *axldev, int msi);
 
 /**
  * is_vmsi_enabled() - Check if VMSI is enabled for device
@@ -70,15 +57,6 @@ int get_vmsi_count(struct axl_pcie_aipu_dev *axldev, int id);
  * @id: VMSI index
  */
 void clear_vmsi_count(struct axl_pcie_aipu_dev *axldev, int id);
-
-/**
- * axl_aipu_irq_handler() - Hard IRQ handler
- * @irq: IRQ number
- * @data: Pointer to irq_wrk structure
- *
- * Return: IRQ_WAKE_THREAD
- */
-irqreturn_t axl_aipu_irq_handler(int irq, void *data);
 
 /* Module parameters */
 extern unsigned int irq_timeout;

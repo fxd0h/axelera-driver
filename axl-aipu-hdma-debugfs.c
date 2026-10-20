@@ -97,7 +97,7 @@ static const struct file_operations axl_aipu_hdma_debugfs_info_fops = {
 #define SHOW_HDMA_SW_REG32(offset, channel, reg)                     \
 	scnprintf(strbuf + off, size - off, "%40s  0x%08x 0x%08x\n", \
 		  __stringify(HDMA_##offset##_##channel),            \
-		  HDMA_##offset##_##channel, hdma->ch[channel].reg);
+		  HDMA_##offset##_##channel, readl(&hdma->ch[channel].reg));
 
 static ssize_t axl_aipu_hdma_debugfs_dbg_regs_read_0(struct file *file,
 						     char __user *user_buf,
@@ -476,7 +476,7 @@ axl_aipu_hdma_debugfs_dbg_rd_chx_ll_write(struct file *file,
 						   axldev->desc_offset);
 	lli = (volatile struct dw_hdma_v0_lli *)__get_ll_base(
 		lldch, DW_HDMA_DIR_WRITE, channel);
-	lli->control = 0;
+	writel(0, &lli->control);
 	dev_dbg(&axldev->pdev->dev, "Linked List Pointer reset\n");
 	return size;
 }
@@ -495,6 +495,7 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 	char *strbuf;
 	size_t size, ret, off = 0;
 	int i = 0;
+	u32 llp_lo, llp_hi;
 
 	size = max_t(size_t, count, 0x2000U);
 
@@ -510,26 +511,24 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 	off = scnprintf(strbuf + off, size - off,
 			"\n\n========= RD Channel %d ================\n",
 			channel);
+	llp_lo = readl(&hdma->ch[channel].rd.llp.lsb);
+	llp_hi = readl(&hdma->ch[channel].rd.llp.msb);
 	off += scnprintf(strbuf + off, size - off, "llp         : 0x%08x%08x\n",
-			 hdma->ch[channel].rd.llp.msb,
-			 hdma->ch[channel].rd.llp.lsb);
-	if (hdma->ch[channel].rd.llp.msb == 0 &&
-	    hdma->ch[channel].rd.llp.lsb == 0) {
+			 llp_hi, llp_lo);
+	if (llp_hi == 0 && llp_lo == 0) {
 		off = scnprintf(strbuf + off, size - off,
 				"Linked List Pointer not configured\n");
 		goto out_rd_chx_ll;
 	}
 
-	hwlldch =
-		(struct dw_hdma_ll_buf *)((uint64_t)hdma->ch[channel].rd.llp.msb
-						  << 32 |
-					  hdma->ch[channel].rd.llp.lsb);
+	hwlldch = (struct dw_hdma_ll_buf *)(((uint64_t)llp_hi << 32) | llp_lo);
 	lldch = (volatile struct dw_hdma_ll_buf *)(axldev->vbase +
 						   axldev->desc_offset);
 	lli = (volatile struct dw_hdma_v0_lli *)__get_ll_base(
 		lldch, DW_HDMA_DIR_READ, channel);
 
-	for (i = 0; (lli->control & (DW_HDMA_V0_CB)) && i < DW_HDMA_LL_MAX_NUM;
+	for (i = 0;
+	     (readl(&lli->control) & (DW_HDMA_V0_CB)) && i < DW_HDMA_LL_MAX_NUM;
 	     i++, lli++) {
 		off += scnprintf(strbuf + off, size - off,
 				 "Linked-list index %d\n", i);
@@ -537,30 +536,30 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 			strbuf + off, size - off,
 			"control       : 0x%016llx 0x%08x\n",
 			(uint64_t)(&hwlldch->ch[channel].rd[i].control),
-			lli->control);
-		if (lli->control & DW_HDMA_V0_LLP) {
+			readl(&lli->control));
+		if (readl(&lli->control) & DW_HDMA_V0_LLP) {
 			off += scnprintf(
 				strbuf + off, size - off,
 				"llp           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].rd[i].sar.reg,
-				lli->sar.reg);
+				readq(&lli->sar.reg));
 		} else {
 			off += scnprintf(strbuf + off, size - off,
 					 "transfer_size : 0x%016llx 0x%08x\n",
 					 (uint64_t)&hwlldch->ch[channel]
 						 .rd[i]
 						 .transfer_size,
-					 lli->transfer_size);
+					 readl(&lli->transfer_size));
 			off += scnprintf(
 				strbuf + off, size - off,
 				"sar           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].rd[i].sar.reg,
-				lli->sar.reg);
+				readq(&lli->sar.reg));
 			off += scnprintf(
 				strbuf + off, size - off,
 				"dar           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].rd[i].dar.reg,
-				lli->dar.reg);
+				readq(&lli->dar.reg));
 		}
 	}
 
@@ -609,8 +608,8 @@ axl_aipu_hdma_debugfs_dbg_wr_chx_ll_write(struct file *file,
 	volatile struct dw_hdma_v0_lli *lli;
 	volatile struct dw_hdma_ll_buf *lldch;
 
-	if (hdma->ch[channel].wr.llp.msb == 0 &&
-	    hdma->ch[channel].wr.llp.lsb == 0) {
+	if (readl(&hdma->ch[channel].wr.llp.msb) == 0 &&
+	    readl(&hdma->ch[channel].wr.llp.lsb) == 0) {
 		dev_err(&axldev->pdev->dev,
 			"Linked List Pointer not configured\n");
 		return size;
@@ -619,7 +618,7 @@ axl_aipu_hdma_debugfs_dbg_wr_chx_ll_write(struct file *file,
 						   axldev->desc_offset);
 	lli = (volatile struct dw_hdma_v0_lli *)__get_ll_base(
 		lldch, DW_HDMA_DIR_WRITE, channel);
-	lli->control = 0;
+	writel(0, &lli->control);
 	dev_dbg(&axldev->pdev->dev, "Linked List Pointer reset\n");
 	return size;
 }
@@ -638,6 +637,7 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 	char *strbuf;
 	size_t size, ret, off = 0;
 	int i = 0;
+	u32 llp_lo, llp_hi;
 
 	size = max_t(size_t, count, 0x2000U);
 	dev_dbg(&axldev->pdev->dev, "WR:channel %d count %ld size %ld\n",
@@ -655,26 +655,24 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 	off = scnprintf(strbuf + off, size - off,
 			"\n\n========= WR Channel %d ================\n",
 			channel);
+	llp_lo = readl(&hdma->ch[channel].wr.llp.lsb);
+	llp_hi = readl(&hdma->ch[channel].wr.llp.msb);
 	off += scnprintf(strbuf + off, size - off, "llp         : 0x%08x%08x\n",
-			 hdma->ch[channel].wr.llp.msb,
-			 hdma->ch[channel].wr.llp.lsb);
-	if (hdma->ch[channel].wr.llp.msb == 0 &&
-	    hdma->ch[channel].wr.llp.lsb == 0) {
+			 llp_hi, llp_lo);
+	if (llp_hi == 0 && llp_lo == 0) {
 		off = scnprintf(strbuf + off, size - off,
 				"Linked List Pointer not configured\n");
 		goto out_wr_chx_ll;
 	}
 
-	hwlldch =
-		(struct dw_hdma_ll_buf *)((uint64_t)hdma->ch[channel].wr.llp.msb
-						  << 32 |
-					  hdma->ch[channel].wr.llp.lsb);
+	hwlldch = (struct dw_hdma_ll_buf *)(((uint64_t)llp_hi << 32) | llp_lo);
 	lldch = (volatile struct dw_hdma_ll_buf *)(axldev->vbase +
 						   axldev->desc_offset);
 	lli = (volatile struct dw_hdma_v0_lli *)__get_ll_base(
 		lldch, DW_HDMA_DIR_WRITE, channel);
 
-	for (i = 0; (lli->control & (DW_HDMA_V0_CB)) && i < DW_HDMA_LL_MAX_NUM;
+	for (i = 0;
+	     (readl(&lli->control) & (DW_HDMA_V0_CB)) && i < DW_HDMA_LL_MAX_NUM;
 	     i++, lli++) {
 		off += scnprintf(strbuf + off, size - off,
 				 "Linked-list index %d\n", i);
@@ -682,30 +680,30 @@ static ssize_t axl_aipu_hdma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 			strbuf + off, size - off,
 			"control       : 0x%016llx 0x%08x\n",
 			(uint64_t)(&hwlldch->ch[channel].wr[i].control),
-			lli->control);
-		if (lli->control & DW_HDMA_V0_LLP) {
+			readl(&lli->control));
+		if (readl(&lli->control) & DW_HDMA_V0_LLP) {
 			off += scnprintf(
 				strbuf + off, size - off,
 				"llp           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].wr[i].sar.reg,
-				lli->sar.reg);
+				readq(&lli->sar.reg));
 		} else {
 			off += scnprintf(strbuf + off, size - off,
 					 "transfer_size : 0x%016llx 0x%08x\n",
 					 (uint64_t)&hwlldch->ch[channel]
 						 .wr[i]
 						 .transfer_size,
-					 lli->transfer_size);
+					 readl(&lli->transfer_size));
 			off += scnprintf(
 				strbuf + off, size - off,
 				"sar           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].wr[i].sar.reg,
-				lli->sar.reg);
+				readq(&lli->sar.reg));
 			off += scnprintf(
 				strbuf + off, size - off,
 				"dar           : 0x%016llx 0x%016llx\n",
 				(uint64_t)&hwlldch->ch[channel].wr[i].dar.reg,
-				lli->dar.reg);
+				readq(&lli->dar.reg));
 		}
 	}
 

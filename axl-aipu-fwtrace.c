@@ -51,7 +51,7 @@ MODULE_PARM_DESC(
 
 /*
  * Firmware datastream structures matching device_datastream_t in
- * libaxldev/include/sysctl_mem.h (SYSCTL_DATASTREAM_AREA_VERSION 2.0).
+ * libaxldev/core/include/sysctl_mem.h (SYSCTL_DATASTREAM_AREA_VERSION 2.0).
  * Must match firmware layout exactly.
  *
  * ring_buffer_ctrl layout (16 bytes):
@@ -156,6 +156,26 @@ static void __iomem *get_data_stream(void __iomem *base, stream_source_t source)
 }
 
 /**
+ * fwtrace_dma_wrk_func - Per-channel workqueue handler for fwtrace DMA reads
+ * @work: Work structure embedded in the dma_wrk
+ *
+ * Runs on the ordered dma_ctrl->wq shared with the user-DMA submitters, which
+ * serialises the channel registers, the descriptor slot and the MSI
+ * completion. Like axl_aipu_dma_wrk_func() without the sctx bookkeeping.
+ */
+static void fwtrace_dma_wrk_func(struct work_struct *work)
+{
+	struct dma_wrk *wrk = container_of(work, struct dma_wrk, work);
+	struct dma_queue_ctrl *dma_ctrl = wrk->qctrl;
+
+	axl_aipu_dma_job_submit(wrk->axldev, wrk);
+
+	/* wrk is the waiter's stack: touch nothing after complete_all(). */
+	atomic_dec(&dma_ctrl->count);
+	complete_all(&wrk->done);
+}
+
+/**
  * fwtrace_dma_read - DMA read from device L2/SPM into fwtrace DMA-coherent buffer
  * @dev:        Device structure
  * @dev_addr:   Device-side AXI address (buf_ref.addr + read_pos)
@@ -164,8 +184,8 @@ static void __iomem *get_data_stream(void __iomem *base, stream_source_t source)
  * @dst_offset: Byte offset into consumer->dma_buffer for the destination
  *
  * Uses the common EDMA/HDMA abstraction (axl_aipu_dma_job_submit) to perform
- * a synchronous DMA read. Called directly from fwtrace_consume_work workqueue
- * context, so axl_aipu_dma_job_submit() is called directly (not re-queued).
+ * a synchronous DMA read. Queued on the channel workqueue so it cannot race a
+ * user transfer on the same channel; blocks, so needs process/wq context.
  *
  * Returns 0 on success, negative error code on failure.
  */
@@ -199,8 +219,9 @@ static int fwtrace_dma_read(struct axl_pcie_aipu_dev *dev, u64 dev_addr,
 	wrk.axldev = dev;
 	wrk.sctx = NULL;
 	wrk.channel = channel;
-	/* READ from device to host: MSI ID follows PMSI_DMA_WR_CH0 mapping */
-	wrk.id = PMSI_DMA_WR_CH0 + channel;
+	/* READ from device to host: serviced by the device write engine */
+	wrk.id = dev->dma_msi_base + (PMSI_DMA_WR_CH0 - PMSI_DMA_RD_CH0) +
+		 channel;
 	wrk.timeout = get_timeout_ms(dma_timeout);
 	wrk.axi = dev_addr;
 	wrk.table = &sgt;
@@ -212,16 +233,25 @@ static int fwtrace_dma_read(struct axl_pcie_aipu_dev *dev, u64 dev_addr,
 	wrk.dmabuf = NULL;
 	wrk.ktime = ktime_get();
 	init_completion(&wrk.done);
+	INIT_WORK(&wrk.work, fwtrace_dma_wrk_func);
 
 	atomic_inc(&dma_ctrl->count);
 	dma_ctrl->num_xfer++;
 	dma_ctrl->bytes_xfer += size;
 	dma_ctrl->size = size;
 
-	/* Submit synchronously — we are already running in workqueue context */
-	axl_aipu_dma_job_submit(dev, &wrk);
+	queue_work(dma_ctrl->wq, &wrk.work);
 
-	atomic_dec(&dma_ctrl->count);
+	if (!wait_for_completion_timeout(&wrk.done, wrk.timeout)) {
+		dev_warn(
+			&dev->pdev->dev,
+			"fwtrace DMA read queue timeout (addr=0x%llx size=%zu)\n",
+			dev_addr, size);
+		/* wrk is on our stack: the work must not outlive it. */
+		flush_work(&wrk.work);
+		if (!wrk.status)
+			wrk.status = -ETIMEDOUT;
+	}
 
 	if (wrk.status)
 		dev_warn(&dev->pdev->dev,
@@ -652,9 +682,9 @@ int axl_fwtrace_init(struct axl_pcie_aipu_dev *dev)
 		spin_lock_init(&kbuf->sessions_lock);
 	}
 
-	/* Create workqueue for deferred processing */
-	consumer->wq = alloc_workqueue(
-		"fwtrace_%s", WQ_MEM_RECLAIM | WQ_UNBOUND, 1, dev->name);
+	/* Not WQ_MEM_RECLAIM: these workers flush_work() onto the non-reclaim
+	 * per-channel DMA queues, which check_flush_dependency() warns about. */
+	consumer->wq = alloc_workqueue("fwtrace_%s", WQ_UNBOUND, 1, dev->name);
 	if (!consumer->wq) {
 		dev_err(&dev->pdev->dev, "Failed to create workqueue\n");
 		ret = -ENOMEM;

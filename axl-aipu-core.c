@@ -37,6 +37,7 @@
 #include <linux/poll.h>
 #include <linux/idr.h>
 #include <linux/kref.h>
+#include <linux/io.h>
 
 #include "axl-aipu-dmabuf.h"
 #include "axl-aipu.h"
@@ -68,6 +69,18 @@
 
 #define AXL_AIPU_MAX_MINORS 256
 
+#define AXL_RECOVERY_POLL_MS   500
+#define AXL_FW_HDIF_INIT_MS    5000
+#define AXL_CFG_READY_MS       1000
+#define AXL_RESTORE_POLL_MS    100
+#define AXL_RESTORE_MAX_TRIES  5
+#define AXL_RESTORE_BACKOFF_MS 1000
+
+/* Values accepted by the axl_aipu_restore sysfs attribute */
+#define AXL_RESTORE_AUTO_OFF 0 /* stop the thread restoring on its own */
+#define AXL_RESTORE_NOW	     1 /* re-arm and restore on the next poll */
+#define AXL_RESTORE_AUTO_ON  2 /* let the thread restore on its own again */
+
 static DEFINE_IDA(axl_aipu_minor_ida);
 struct dentry *axl_aipu_debugfs_root;
 
@@ -85,6 +98,9 @@ MODULE_PARM_DESC(enable_dmabuf_sync,
 
 static unsigned int single_msi = 0;
 module_param(single_msi, uint, 0644);
+MODULE_PARM_DESC(
+	single_msi,
+	"Use one MSI vector for all interrupt sources (default 0 disabled, 1 enabled)");
 
 unsigned int dma_poll = 0;
 module_param(dma_poll, uint, 0644);
@@ -133,6 +149,7 @@ static int sysctrl_open(struct inode *inode, struct file *file)
 	INIT_LIST_HEAD(&sys_ctx->node);
 	init_waitqueue_head(&sys_ctx->poll_wait_queue);
 	atomic_set(&sys_ctx->poll_event_cnt, 0);
+	atomic_set(&sys_ctx->msg_flag, 0);
 	sys_ctx->axldev = axldev;
 	file->private_data = sys_ctx;
 
@@ -155,7 +172,7 @@ struct sys_ctx_cleanup {
 	struct dma_wrk *dma_wrk;
 };
 
-static void axl_aipu_sys_ctx_cleanup_dmabuf(struct sysctrl_ctx *sys_ctx)
+void axl_aipu_sys_ctx_cleanup_dmabuf(struct sysctrl_ctx *sys_ctx)
 {
 	struct dmabuf_imp *di = &sys_ctx->di;
 	struct axl_pcie_aipu_dev *axldev = sys_ctx->axldev;
@@ -168,6 +185,8 @@ static void axl_aipu_sys_ctx_cleanup_dmabuf(struct sysctrl_ctx *sys_ctx)
 		dma_buf_detach(di->dmabuf, di->attachment);
 		dma_buf_put(di->dmabuf);
 		di->dmabuf = NULL;
+		di->attachment = NULL;
+		di->table = NULL;
 	}
 }
 
@@ -192,17 +211,12 @@ static void axl_aipu_sys_ctx_cleanup_func(struct work_struct *work)
 
 	dev_dbg(&pdev->dev, "Async cleanup: waiting for dma_wrk %p\n", dma_wrk);
 
-	/*
-	 * Use cancel_work_sync() rather than flush_work() to avoid the
-	 * kernel 5.15+ lockdep warning triggered by calling flush_work()
-	 * from within a workqueue worker context. cancel_work_sync() uses
-	 * from_cancel=true internally, bypassing the check, and is safe
-	 * here: on fd-close we either let the DMA work finish or cancel
-	 * it before freeing resources — both outcomes are correct.
-	 */
-	cancel_work_sync(&dma_wrk->work);
+	if (cancel_work_sync(&dma_wrk->work) && dma_wrk->usr_dma) {
+		dev_dbg(&pdev->dev, "Async cleanup: work %p was cancelled\n",
+			dma_wrk);
+		kref_put(&dma_wrk->refcount, axl_aipu_dma_wrk_release);
+	}
 
-	/* Now safe to release dmabuf and free sys_ctx */
 	kref_put(&dma_wrk->refcount, axl_aipu_dma_wrk_release);
 	axl_aipu_sys_ctx_cleanup_dmabuf(sys_ctx);
 
@@ -219,11 +233,7 @@ axl_aipu_sys_ctx_release_from_work_context(struct sysctrl_ctx *sys_ctx,
 	struct pci_dev *pdev = axldev->pdev;
 
 	dev_dbg(&pdev->dev, "Release from work context, skipping flush\n");
-
-	/* Release sys_ctx's reference to dma_wrk */
 	kref_put(&dma_wrk->refcount, axl_aipu_dma_wrk_release);
-
-	/* Normal cleanup */
 	axl_aipu_sys_ctx_cleanup_dmabuf(sys_ctx);
 	axl_aipu_sys_ctx_cleanup_final(sys_ctx);
 }
@@ -359,7 +369,7 @@ static int sysctrl_release(struct inode *inode, struct file *file)
 	struct sysctrl_ctx *sys_ctx = file->private_data;
 	struct axl_pcie_aipu_dev *axldev = sys_ctx->axldev;
 
-	if (sys_ctx->msg_flag)
+	if (atomic_cmpxchg(&sys_ctx->msg_flag, 1, 0) == 1)
 		mutex_unlock(&axldev->msg_mutex);
 
 	/* Cleanup firmware trace session if active */
@@ -440,20 +450,34 @@ static ssize_t axl_aipu_restore_store(struct device *dev,
 	struct axl_pcie_aipu_dev *axldev = dev_get_drvdata(dev);
 	struct pci_dev *pdev = axldev->pdev;
 	unsigned long val;
-	int ret;
 
 	if (kstrtoul(buf, 0, &val) != 0)
 		return -EINVAL;
 
-	dev_info(&pdev->dev, "Recovery device state\n");
-	pci_load_saved_state(pdev, axldev->pcie_state);
-	pci_restore_state(pdev);
-	ret = pci_enable_device(pdev);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to enable device\n");
-		return ret;
+	switch (val) {
+	case AXL_RESTORE_AUTO_OFF:
+		axldev->auto_recovery = false;
+		dev_info(&pdev->dev, "Automatic recovery disabled\n");
+		return count;
+	case AXL_RESTORE_AUTO_ON:
+		axldev->auto_recovery = true;
+		dev_info(&pdev->dev, "Automatic recovery enabled\n");
+		return count;
+	case AXL_RESTORE_NOW: break;
+	default: return -EINVAL;
 	}
-	pci_set_master(pdev);
+
+	if (!pci_device_is_present(pdev)) {
+		dev_err(&pdev->dev,
+			"device does not answer config reads, skipping restore\n");
+		return -ENODEV;
+	}
+
+	dev_info(&pdev->dev, "Re-arming device recovery\n");
+	axldev->restore_fails = 0;
+	axldev->dev_state = 1;
+	atomic_set(&axldev->dev_unreachable, 0);
+
 	return count;
 }
 static DEVICE_ATTR(axl_aipu_restore, 0664, axl_aipu_restore_show,
@@ -465,6 +489,118 @@ static struct attribute *axl_aipu_pcie_axl_attrs[] = {
 };
 ATTRIBUTE_GROUPS(axl_aipu_pcie_axl);
 
+static bool axl_aipu_dev_needs_restore(struct axl_pcie_aipu_dev *axldev)
+{
+	const u16 enabled = PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY;
+	struct pci_dev *pdev = axldev->pdev;
+	u16 cmd = 0;
+
+	if (!pci_device_is_present(pdev))
+		return true;
+
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+
+	return (cmd & enabled) != enabled;
+}
+
+static bool axl_aipu_recovery_stopping(struct axl_pcie_aipu_dev *axldev)
+{
+	return axldev->recovery == current && kthread_should_stop();
+}
+
+static bool axl_aipu_sleep_stoppable(struct axl_pcie_aipu_dev *axldev,
+				     unsigned int ms)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(ms);
+
+	while (time_before(jiffies, end)) {
+		if (axl_aipu_recovery_stopping(axldev))
+			return false;
+		msleep(min_t(unsigned int, ms, AXL_RESTORE_POLL_MS));
+	}
+
+	return true;
+}
+
+static bool axl_aipu_dev_cfg_ready(struct axl_pcie_aipu_dev *axldev,
+				   unsigned int timeout_ms)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(timeout_ms);
+
+	do {
+		if (pci_device_is_present(axldev->pdev))
+			return true;
+		msleep(AXL_RESTORE_POLL_MS);
+	} while (time_before(jiffies, end) &&
+		 !axl_aipu_recovery_stopping(axldev));
+
+	return false;
+}
+
+static int axl_aipu_dev_restore(struct axl_pcie_aipu_dev *axldev)
+{
+	struct pci_dev *pdev = axldev->pdev;
+	int ret;
+
+	dev_dbg(&pdev->dev, "Wait FW init dynamic area\n");
+	if (!axl_aipu_sleep_stoppable(axldev, AXL_FW_HDIF_INIT_MS))
+		return -ENODEV;
+
+	if (!axl_aipu_dev_cfg_ready(axldev, AXL_CFG_READY_MS)) {
+		dev_err(&pdev->dev,
+			"device does not answer config reads, skipping restore\n");
+		return -ENODEV;
+	}
+
+	pci_load_saved_state(pdev, axldev->pcie_state);
+	pci_restore_state(pdev);
+	ret = pci_enable_device(pdev);
+	if (ret) {
+		dev_err(&pdev->dev, "pci_enable_device failed (%d)\n", ret);
+		return ret;
+	}
+	pci_set_master(pdev);
+	axl_aipu_config_dev_dma(axldev);
+	axl_aipu_config_dev_msi(axldev);
+	axl_aipu_dev_dynmem_init(axldev);
+	axl_aipu_dma_imwr_restore(axldev);
+	axl_aipu_fwtrace_refresh(axldev);
+	axldev->dev_state = 0;
+
+	return 0;
+}
+
+void axl_aipu_dev_problem(struct axl_pcie_aipu_dev *axldev, const char *reason)
+{
+	struct pci_dev *pdev = axldev->pdev;
+
+	axldev->dev_state = 1;
+	if (atomic_xchg(&axldev->dev_unreachable, 1))
+		return;
+
+	axl_aipu_fwtrace_kill_sessions(axldev);
+	dev_err(&pdev->dev,
+		"device problem detected (%s), recovery stopped: write 1 to axl_aipu_restore to re-arm\n",
+		reason);
+}
+
+/*
+ * Restore the device, keeping track of consecutive failures so that a device
+ * that never comes back stops being retried instead of starving the CPU.
+ */
+static void axl_aipu_dev_try_restore(struct axl_pcie_aipu_dev *axldev)
+{
+	if (!axl_aipu_dev_restore(axldev)) {
+		axldev->restore_fails = 0;
+		return;
+	}
+
+	if (++axldev->restore_fails >= AXL_RESTORE_MAX_TRIES)
+		axl_aipu_dev_problem(axldev, "restore failed repeatedly");
+	else
+		axl_aipu_sleep_stoppable(axldev, AXL_RESTORE_BACKOFF_MS);
+}
+
 static int axl_aipu_recovery(void *data)
 {
 	struct axl_pcie_aipu_dev *axldev = (struct axl_pcie_aipu_dev *)data;
@@ -472,43 +608,50 @@ static int axl_aipu_recovery(void *data)
 	struct pci_dev *port = pdev->bus->self;
 	u16 lnksta = 0;
 	int link = 1;
-	int ret;
+
 	while (!kthread_should_stop()) {
-		pcie_capability_read_word(port, PCI_EXP_LNKSTA, &lnksta);
-		if (link && !(lnksta & PCI_EXP_LNKSTA_DLLLA)) {
-			if (!axldev->dev_state) {
-				dev_info(&pdev->dev, "Link down\n");
-				axl_aipu_fwtrace_kill_sessions(axldev);
+		/*
+		 * Disarmed by a device problem: do not touch config space at
+		 * all until the axl_aipu_restore attribute is written. A
+		 * config access that has to time out is charged to the global
+		 * PCI config lock, so polling a broken hierarchy from here
+		 * would stall config access for the whole system.
+		 */
+		if (!axl_aipu_dev_is_unreachable(axldev)) {
+			pcie_capability_read_word(port, PCI_EXP_LNKSTA,
+						  &lnksta);
+
+			if (axldev->auto_recovery && link &&
+			    !(lnksta & PCI_EXP_LNKSTA_DLLLA)) {
+				if (!axldev->dev_state) {
+					dev_info(&pdev->dev, "Link down\n");
+					axl_aipu_fwtrace_kill_sessions(axldev);
+				}
+				axldev->dev_state = 1;
 			}
-			axldev->dev_state = 1;
+
+			if (axldev->dev_state &&
+			    (lnksta & PCI_EXP_LNKSTA_DLLLA)) {
+				dev_info(&pdev->dev, "Link up\n");
+				link = 1;
+				axl_aipu_dev_try_restore(axldev);
+			} else if (axldev->auto_recovery &&
+				   (lnksta & PCI_EXP_LNKSTA_DLLLA) &&
+				   axl_aipu_dev_needs_restore(axldev)) {
+				dev_warn(&pdev->dev,
+					 "Device state lost, restoring\n");
+				axldev->dev_state = 1;
+				axl_aipu_fwtrace_kill_sessions(axldev);
+				axl_aipu_dev_try_restore(axldev);
+			}
+
+			link = (lnksta & PCI_EXP_LNKSTA_DLLLA) ? 1 : 0;
 		}
 
-		if (axldev->dev_state && (lnksta & PCI_EXP_LNKSTA_DLLLA)) {
-			dev_info(&pdev->dev, "Link up\n");
-			link = 1;
-			msleep(5000);
-			dev_dbg(&pdev->dev, "Wait FW init dynamic area\n");
-			pci_load_saved_state(pdev, axldev->pcie_state);
-			pci_restore_state(pdev);
-			ret = pci_enable_device(pdev);
-			if (ret)
-				dev_err(&pdev->dev,
-					"pci_enable_device failed (%d) ", ret);
-			else
-				axldev->dev_state = 0;
-			pci_set_master(pdev);
-			axl_aipu_config_dev_dma(axldev);
-			axl_aipu_config_dev_msi(axldev);
-			axl_aipu_dev_dynmem_init(axldev);
-			axl_aipu_dma_imwr_restore(axldev);
-			axl_aipu_fwtrace_refresh(axldev);
-		}
-
-		link = (lnksta & PCI_EXP_LNKSTA_DLLLA) ? 1 : 0;
 		/*The teoretical Gen1 to Gen3  switch according to spec is 100 ms .. 800 ms.
-		For safety: we set this to 80 ms and this should work every time now even with our
+		For safety: we set this to 500 ms and this should work every time now even with our
 		Omega boot code now in ROM*/
-		msleep(80);
+		axl_aipu_sleep_stoppable(axldev, AXL_RECOVERY_POLL_MS);
 	}
 
 	return 0;
@@ -537,19 +680,14 @@ static int axl_pci_msi_init(struct pci_dev *pdev,
 		dev_info(&pdev->dev, "MSI registered %d (%d)\n", nmsi, err);
 	axldev->nmsi = err;
 
-	axldev->irq_wrk = devm_kcalloc(&pdev->dev, MAX_VIRT_MSI,
-				       sizeof(*axldev->irq_wrk), GFP_KERNEL);
-	if (!axldev->irq_wrk)
-		return -ENOMEM;
-
-	axldev->vmsi_count = devm_kcalloc(&pdev->dev, MAX_VIRT_MSI,
-					  sizeof(*axldev->vmsi_count),
-					  GFP_KERNEL);
-	if (!axldev->vmsi_count)
-		return -ENOMEM;
-
 	axldev->irq_vec = pci_irq_vector(pdev, 0);
 	dev_info(&pdev->dev, "irq vec number %d\n", axldev->irq_vec);
+
+	if (axldev->nmsi == 1 &&
+	    axldev->dev_info->hw_gen >= AXL_HW_GEN_EUROPA) {
+		axldev->dma_poll_only = 1;
+		dev_dbg(&pdev->dev, "Single-MSI: DMA forced to polling mode\n");
+	}
 
 	/* Initialize and register IRQ handlers via MSI-specific init function */
 	err = axldev->msi_fops->init(axldev);
@@ -599,8 +737,6 @@ static void axl_aipu_pci_deinit(struct pci_dev *pdev)
 {
 	axl_aipu_disable_dev_dma(pdev);
 	pci_clear_master(pdev);
-	pci_release_regions(pdev);
-	pci_disable_device(pdev);
 }
 
 static void disable_serr_bit(struct pci_dev *pdev)
@@ -760,6 +896,24 @@ static int axl_aipu_pci_resources_init(struct axl_pcie_aipu_dev *axldev)
 		axldev->res_info->sysspm_base = axldev->pbase;
 		axldev->res_info->sysspm_size = pci_resource_len(pdev, BAR_2);
 	}
+
+	axldev->irq_wrk = devm_kcalloc(&pdev->dev, MAX_VIRT_MSI,
+				       sizeof(*axldev->irq_wrk), GFP_KERNEL);
+	if (!axldev->irq_wrk)
+		return -ENOMEM;
+
+	axldev->vmsi_count = devm_kcalloc(&pdev->dev, MAX_VIRT_MSI,
+					  sizeof(*axldev->vmsi_count),
+					  GFP_KERNEL);
+	if (!axldev->vmsi_count)
+		return -ENOMEM;
+
+	/* Destination of the VMSI table copy; stays empty until firmware exports one */
+	axldev->msi_cfg_buf = devm_kzalloc(
+		&pdev->dev, sizeof(*axldev->msi_cfg_buf), GFP_KERNEL);
+	if (!axldev->msi_cfg_buf)
+		return -ENOMEM;
+
 	return 0;
 }
 
@@ -795,8 +949,10 @@ static int axl_aipu_pci_init(struct pci_dev *pdev,
 	if (err)
 		goto pci_err_out;
 
-	disable_serr_bit(pdev);
-	mask_all_aer_errors(pdev);
+	if (axldev->dev_info->hw_gen == AXL_HW_GEN_METIS) {
+		disable_serr_bit(pdev);
+		mask_all_aer_errors(pdev);
+	}
 
 	axl_aipu_get_memwindow_info(axldev, pdev);
 
@@ -1013,10 +1169,7 @@ static void axl_aipu_register_dev_fops(struct axl_pcie_aipu_dev *axldev)
 
 static void axl_aipu_register_msi_dev_fops(struct axl_pcie_aipu_dev *axldev)
 {
-	if (axldev->dev_info->hw_gen >= AXL_HW_GEN_EUROPA)
-		axl_aipu_register_msi_fops(axldev);
-	else
-		axl_aipu_register_msi_metis_fops(axldev);
+	axl_aipu_register_msi_fops(axldev);
 }
 
 static struct device_host_drv_t *
@@ -1070,14 +1223,61 @@ void axl_aipu_config_dev_dma(struct axl_pcie_aipu_dev *axldev)
 	dev_info(&pdev->dev, "vmsi configured\n");
 }
 
+/**
+ * axl_aipu_cache_dev_msi() - Take a host copy of the firmware VMSI table
+ * @axldev: Device context
+ *
+ * The table lives in BAR 2, so reading a field of it costs a non-posted PCIe
+ * read that occupies the device register path until it completes. Multi-MSI can
+ * afford that - the vector names the trigger, so its handler reads one entry -
+ * but the single-MSI sweep has no source to go on and walks every published
+ * trigger per interrupt. Sustained, that starves the bus the firmware itself
+ * runs on, not just the host.
+ *
+ * The table is static once firmware has published it, so the handlers can read
+ * a copy in host memory. Every path that can change it - probe, the firmware
+ * reload ioctl, and link recovery - reaches this through
+ * axl_aipu_config_dev_msi(), so the copy is refreshed exactly when the device's
+ * own table is.
+ *
+ * The trailing vmsi_to_pmsi[] is not copied: nothing in the driver reads it.
+ */
+static void axl_aipu_cache_dev_msi(struct axl_pcie_aipu_dev *axldev)
+{
+	struct device_vmsi_config_t *dev_cfg;
+
+	/*
+	 * Firmware exports the table in the dynamic area, and may not have done
+	 * so at this point - at probe, or after a reload or a link recovery that
+	 * this call follows. msi_cfg stays NULL then, exactly as when it pointed
+	 * at the BAR, and the handlers keep falling back to the flat scan.
+	 */
+	dev_cfg = axl_aipu_get_msi_config_area(axldev);
+	if (!dev_cfg || !axldev->msi_cfg_buf) {
+		dev_dbg(&axldev->pdev->dev, "No VMSI config area exported\n");
+		axldev->msi_cfg = NULL;
+		return;
+	}
+
+	/*
+	 * Refilled in place, with no publication barrier: no interrupt can be
+	 * taken while this runs. At probe the handler is not registered yet, on
+	 * the recovery path the device has not finished coming back, and the
+	 * firmware reload ioctl runs while the device is quiesced.
+	 */
+	memcpy_fromio(axldev->msi_cfg_buf, dev_cfg,
+		      sizeof(*axldev->msi_cfg_buf));
+	axldev->msi_cfg = axldev->msi_cfg_buf;
+
+	dev_info(&axldev->pdev->dev, "VMSI table cached (%u pmsi, %u vmsi)\n",
+		 axldev->msi_cfg->num_pmsi, axldev->msi_cfg->num_vmsi);
+}
+
 void axl_aipu_config_dev_msi(struct axl_pcie_aipu_dev *axldev)
 {
-	struct device_vmsi_config_t *msi_cfg;
+	axl_aipu_cache_dev_msi(axldev);
 
-	msi_cfg = axl_aipu_get_msi_config_area(axldev);
-	axldev->msi_cfg = msi_cfg;
-
-	if (axldev->msi_cfg) {
+	if (axl_aipu_has_vmsi_cfg(axldev)) {
 		axldev->max_msi = axldev->msi_cfg->num_vmsi;
 	} else if (axldev->dev_info->hw_gen >= AXL_HW_GEN_EUROPA) {
 		axldev->max_msi = MAX_VIRT_MSI;
@@ -1086,9 +1286,22 @@ void axl_aipu_config_dev_msi(struct axl_pcie_aipu_dev *axldev)
 	}
 
 	axl_aipu_register_msi_dev_fops(axldev);
+
+	if (axldev->msi_fops->remap)
+		axldev->msi_fops->remap(axldev);
 }
 
-static void axl_aipu_drv_dma_alloc(struct axl_pcie_aipu_dev *axldev)
+/*
+ * axl_aipu_drv_dma_alloc() - Allocate the coherent VMSI / descriptor buffer.
+ *
+ * The interrupt handlers dereference axldev->dma_va unconditionally, so a
+ * device whose buffer could not be allocated must not be registered. Failure
+ * is propagated so probe can abort before the char device is published and the
+ * MSI vectors are requested.
+ *
+ * Return: 0 on success, -ENOMEM if the buffer cannot be allocated.
+ */
+static int axl_aipu_drv_dma_alloc(struct axl_pcie_aipu_dev *axldev)
 {
 	struct pci_dev *pdev = axldev->pdev;
 	dma_addr_t dma_addr = 0;
@@ -1104,7 +1317,7 @@ static void axl_aipu_drv_dma_alloc(struct axl_pcie_aipu_dev *axldev)
 	if (axldev->dma_va_unaligned == NULL) {
 		dev_err(&pdev->dev, "Fail to dma alloc %x\n",
 			axldev->dma_alloc_size);
-		return;
+		return -ENOMEM;
 	}
 	axldev->dma_addr_unaligned = dma_addr;
 	aligned_dma_addr = ALIGN(dma_addr, axldev->dma_size);
@@ -1134,6 +1347,8 @@ static void axl_aipu_drv_dma_alloc(struct axl_pcie_aipu_dev *axldev)
 		axldev->desc_host_size);
 
 	axl_aipu_config_dev_dma(axldev);
+
+	return 0;
 }
 
 static void axl_aipu_drv_dma_free(struct axl_pcie_aipu_dev *axldev)
@@ -1235,27 +1450,32 @@ static int axl_aipu_drv_recovery_init(struct axl_pcie_aipu_dev *axldev)
 		return 0;
 	}
 
-	/* Check if parent port exists and is not a QEMU device */
-	if (pdev->bus && pdev->bus->self) {
-		parent_port = pdev->bus->self;
-		pci_read_config_word(parent_port, PCI_VENDOR_ID,
-				     &parent_vendor);
-		pci_read_config_word(parent_port, PCI_SUBSYSTEM_ID,
-				     &parent_subsys_device);
+	/* The thread polls the parent port link status, so it needs one */
+	if (!pdev->bus || !pdev->bus->self) {
+		dev_info(&pdev->dev,
+			 "No parent port, skipping recovery thread\n");
+		axldev->recovery = NULL;
+		return 0;
+	}
 
-		/* Skip recovery thread for QEMU (vendor ID 0x1b36 or subsystem device ID 0x1100) */
-		if (parent_vendor == PCI_VENDOR_ID_REDHAT ||
-		    parent_subsys_device == PCI_SUBDEVICE_ID_QEMU) {
-			dev_info(
-				&pdev->dev,
-				"QEMU parent port detected, skipping recovery thread\n");
-			axldev->recovery = NULL;
-			return 0;
-		}
+	parent_port = pdev->bus->self;
+	pci_read_config_word(parent_port, PCI_VENDOR_ID, &parent_vendor);
+	pci_read_config_word(parent_port, PCI_SUBSYSTEM_ID,
+			     &parent_subsys_device);
+
+	/* Skip recovery thread for QEMU (vendor ID 0x1b36 or subsystem device ID 0x1100) */
+	if (parent_vendor == PCI_VENDOR_ID_REDHAT ||
+	    parent_subsys_device == PCI_SUBDEVICE_ID_QEMU) {
+		dev_info(
+			&pdev->dev,
+			"QEMU parent port detected, skipping recovery thread\n");
+		axldev->recovery = NULL;
+		return 0;
 	}
 
 	dev_info(&pdev->dev,
 		 "Data Link Layer Link Active Reporting capability\n");
+	axldev->auto_recovery = true;
 	axldev->recovery =
 		kthread_run(axl_aipu_recovery, axldev, "%s", axldev->name);
 	if (IS_ERR(axldev->recovery)) {
@@ -1340,7 +1560,13 @@ static int axl_aipu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	spin_lock_init(&axldev->msi_lock);
 
-	axl_aipu_drv_dma_alloc(axldev);
+	/*
+	 * Without the VMSI buffer the device cannot deliver interrupts and the
+	 * handlers would fault on the first MSI, so refuse to register it.
+	 */
+	err = axl_aipu_drv_dma_alloc(axldev);
+	if (err)
+		goto err_dma_out;
 
 	/* Allocate DMA trace buffer */
 	err = axl_aipu_trace_alloc(axldev, dma_trace_entries);
@@ -1382,9 +1608,12 @@ err_dev_dma_out:
 	axl_aipu_dma_deinit(axldev);
 	axl_aipu_remove_compat_symlink(axldev->class_dev, axldev->compat_name);
 err_dev_out:
+	if (!IS_ERR_OR_NULL(axldev->recovery))
+		kthread_stop(axldev->recovery);
 	device_destroy(axl_aipu_class, MKDEV(axl_aipu_major, axldev->minor));
 	cdev_del(&axldev->cdev);
 	axl_aipu_drv_dma_free(axldev);
+err_dma_out:
 	axl_aipu_pci_deinit(pdev);
 err_init_out:
 	axl_aipu_free_minor(axldev);
@@ -1392,12 +1621,11 @@ err_init_out:
 }
 
 /*
- * axl_aipu_sync_irqs() - Wait for all MSI handlers to finish executing.
+ * axl_aipu_sync_irqs() - Drain in-flight MSI handlers, then free every vector.
  *
- * Calls synchronize_irq() on every allocated MSI vector so that no interrupt
- * handler is running (or pending) once this returns. Must be called after the
- * device's interrupt generation has been stopped and before resources the
- * handlers reference (e.g. the VMSI DMA buffer) are released.
+ * synchronize_irq() waits out any running handler; devm_free_irq() then disables
+ * each line so it cannot be re-triggered. Call before releasing resources the
+ * handlers reference (e.g. the VMSI DMA buffer), so none can run afterwards.
  */
 static void axl_aipu_sync_irqs(struct axl_pcie_aipu_dev *axldev)
 {
@@ -1406,6 +1634,16 @@ static void axl_aipu_sync_irqs(struct axl_pcie_aipu_dev *axldev)
 
 	for (i = 0; i < axldev->nmsi; i++)
 		synchronize_irq(pci_irq_vector(pdev, i));
+
+	for (i = 0; i < axldev->nmsi; i++)
+		devm_free_irq(&pdev->dev, pci_irq_vector(pdev, i),
+			      &axldev->irq_wrk[i]);
+	/*
+	 * Nothing frees the vectors for us: pcim_enable_device() stopped doing
+	 * it in 6.11, and leaving them allocated hands a populated MSI domain to
+	 * msi_device_data_release() at unbind, which warns.
+	 */
+	pci_free_irq_vectors(pdev);
 }
 
 static void axl_aipu_remove(struct pci_dev *pdev)
@@ -1413,14 +1651,16 @@ static void axl_aipu_remove(struct pci_dev *pdev)
 	struct axl_pcie_aipu_dev *axldev = pci_get_drvdata(pdev);
 	unsigned int minor = MINOR(axldev->cdev.dev);
 
+	if (axldev->recovery)
+		kthread_stop(axldev->recovery);
+
 	/*
-	 * Stop the device from generating any further interrupts before
-	 * tearing anything down. pci_clear_master() clears Bus Master Enable,
-	 * which immediately stops bus-master MSI writes even if the link/FW is
-	 * gone. axl_aipu_sync_irqs() then drains any interrupt already latched
-	 * in the APIC or in-flight on another CPU, so no handler is running once
-	 * it returns. Only then is the VMSI DMA buffer (axldev->dma_va) safe to
-	 * release in axl_aipu_drv_dma_free().
+	 * Stop interrupts before tearing anything down. pci_clear_master()
+	 * clears Bus Master Enable to stop MSI writes; axl_aipu_sync_irqs() then
+	 * drains and frees the vectors. Freeing (not just synchronize_irq()) is
+	 * what guarantees no handler runs on a fresh MSI latched afterwards - so
+	 * none can dereference the VMSI DMA buffer (axldev->dma_va) once
+	 * axl_aipu_drv_dma_free() releases it.
 	 */
 	pci_clear_master(pdev);
 	axl_aipu_sync_irqs(axldev);
@@ -1443,8 +1683,6 @@ static void axl_aipu_remove(struct pci_dev *pdev)
 
 	axl_aipu_drv_dma_free(axldev);
 	axl_aipu_dma_deinit(axldev);
-	if (axldev->recovery)
-		kthread_stop(axldev->recovery);
 	if (axldev->pcie_state)
 		kfree(axldev->pcie_state);
 
@@ -1467,6 +1705,12 @@ static void axl_io_resume(struct pci_dev *pdev)
 	int ret;
 
 	dev_dbg(&pdev->dev, "axl io resume\n");
+
+	if (!pci_device_is_present(pdev)) {
+		dev_err(&pdev->dev,
+			"device does not answer config reads, skipping restore\n");
+		return;
+	}
 
 	pci_restore_state(pdev);
 	ret = pci_enable_device(pdev);
@@ -1512,8 +1756,13 @@ static pci_ers_result_t axl_io_error_detected(struct pci_dev *pdev,
 		dev_warn(&pdev->dev, "%s : Request a slot reset %p:%p\n",
 			 __func__, pdev, port);
 		pci_bridge_secondary_bus_reset(port);
-		pdev->state_saved = true;
-		pci_restore_state(pdev);
+		if (pci_device_is_present(pdev)) {
+			pdev->state_saved = true;
+			pci_restore_state(pdev);
+		} else {
+			dev_err(&pdev->dev,
+				"device does not answer config reads after slot reset\n");
+		}
 	}
 
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -1536,6 +1785,10 @@ static pci_ers_result_t axl_io_slot_reset(struct pci_dev *pdev)
 	if (err) {
 		dev_err(&pdev->dev,
 			"Cannot re-enable PCI device after reset.\n");
+		result = PCI_ERS_RESULT_DISCONNECT;
+	} else if (!pci_device_is_present(pdev)) {
+		dev_err(&pdev->dev,
+			"device does not answer config reads after reset\n");
 		result = PCI_ERS_RESULT_DISCONNECT;
 	} else {
 		dev_info(&pdev->dev, "Restore bars\n");

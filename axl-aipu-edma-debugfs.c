@@ -100,7 +100,7 @@ static const struct file_operations axl_aipu_edma_debugfs_info_fops = {
 	scnprintf(strbuf + off, size - off, "%40s  0x%08x 0x%08x\n", \
 		  __stringify(DMA_##offset##_##channel),             \
 		  DMA_##offset##_##channel,                          \
-		  edma->type.unroll.ch[channel].reg);
+		  readl(&edma->type.unroll.ch[channel].reg));
 
 static ssize_t axl_aipu_edma_debugfs_dbg_ch_regs_read(struct file *file,
 						      char __user *user_buf,
@@ -223,7 +223,7 @@ static const struct file_operations axl_aipu_edma_debugfs_dbg_ch_regs_fops = {
 #define SHOW_EDMA_SW_REG32(offset, reg)                                \
 	scnprintf(strbuf + off, size - off, "%40s  0x%08x 0x%08x\n",   \
 		  __stringify(DMA_##offset##_OFF), DMA_##offset##_OFF, \
-		  edma->reg);
+		  readl(&edma->reg));
 
 static ssize_t axl_aipu_edma_debugfs_dbg_regs_read(struct file *file,
 						   char __user *user_buf,
@@ -315,18 +315,17 @@ axl_aipu_edma_debugfs_dbg_rd_chx_ll_write(struct file *file,
 	struct axl_pcie_aipu_dev *axldev = file->private_data;
 	volatile struct dw_edma_v0_regs *edma = axldev->dma;
 	volatile struct dw_edma_v0_lli *lli;
+	u32 llp_lo = readl(&edma->type.unroll.ch[channel].rd.llp.lsb);
+	u32 llp_hi = readl(&edma->type.unroll.ch[channel].rd.llp.msb);
 
-	if (edma->type.unroll.ch[channel].rd.llp.msb == 0 &&
-	    edma->type.unroll.ch[channel].rd.llp.lsb == 0) {
+	if (llp_hi == 0 && llp_lo == 0) {
 		dev_err(&axldev->pdev->dev,
 			"Linked List Pointer not configured\n");
 		return size;
 	}
-	lli = axldev->vbase +
-	      (((uint64_t)edma->type.unroll.ch[channel].rd.llp.msb << 32) +
-	       edma->type.unroll.ch[channel].rd.llp.lsb) -
+	lli = axldev->vbase + (((uint64_t)llp_hi << 32) + llp_lo) -
 	      EDMA_L2_BASE;
-	lli->control = 0;
+	writel(0, &lli->control);
 	dev_dbg(&axldev->pdev->dev, "Linked List Pointer reset\n");
 	return size;
 }
@@ -344,6 +343,7 @@ static ssize_t axl_aipu_edma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 	char *strbuf;
 	size_t size, ret, off = 0;
 	int i = 0;
+	u32 llp_lo, llp_hi;
 
 	size = max_t(size_t, count, 0x2000U);
 
@@ -356,29 +356,24 @@ static ssize_t axl_aipu_edma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 				"Wrong channel %d [ 0- 3 ]\n", channel);
 		goto out_rd_chx_ll;
 	}
+	llp_lo = readl(&edma->type.unroll.ch[channel].rd.llp.lsb);
+	llp_hi = readl(&edma->type.unroll.ch[channel].rd.llp.msb);
 	off = scnprintf(strbuf + off, size - off,
 			"\n\n========= RD Channel %d ================\n",
 			channel);
 	off += scnprintf(strbuf + off, size - off, "llp         : 0x%08x%08x\n",
-			 edma->type.unroll.ch[channel].rd.llp.msb,
-			 edma->type.unroll.ch[channel].rd.llp.lsb);
-	if (edma->type.unroll.ch[channel].rd.llp.msb == 0 &&
-	    edma->type.unroll.ch[channel].rd.llp.lsb == 0) {
+			 llp_hi, llp_lo);
+	if (llp_hi == 0 && llp_lo == 0) {
 		off = scnprintf(strbuf + off, size - off,
 				"Linked List Pointer not configured\n");
 		goto out_rd_chx_ll;
 	}
 
-	hwlldch = (struct dw_edma_ll_buf
-			   *)((uint64_t)edma->type.unroll.ch[channel].rd.llp.msb
-				      << 32 |
-			      edma->type.unroll.ch[channel].rd.llp.lsb);
-	lli = axldev->vbase +
-	      (((uint64_t)edma->type.unroll.ch[channel].rd.llp.msb << 32) +
-	       edma->type.unroll.ch[channel].rd.llp.lsb) -
+	hwlldch = (struct dw_edma_ll_buf *)(((uint64_t)llp_hi << 32) | llp_lo);
+	lli = axldev->vbase + (((uint64_t)llp_hi << 32) + llp_lo) -
 	      EDMA_L2_BASE;
 
-	for (i = 0; (lli->control & (DW_EDMA_V0_CB | DW_EDMA_V0_TCB)) &&
+	for (i = 0; (readl(&lli->control) & (DW_EDMA_V0_CB | DW_EDMA_V0_TCB)) &&
 		    i < DW_EDMA_LL_NUM;
 	     i++, lli++) {
 		off += scnprintf(strbuf + off, size - off,
@@ -387,20 +382,20 @@ static ssize_t axl_aipu_edma_debugfs_dbg_rd_chx_ll_read(struct file *file,
 			strbuf + off, size - off,
 			"control       : 0x%016llx 0x%08x\n",
 			(uint64_t)(&hwlldch->ch[channel].rd[i].control),
-			lli->control);
+			readl(&lli->control));
 		off += scnprintf(
 			strbuf + off, size - off,
 			"transfer_size : 0x%016llx 0x%08x\n",
 			(uint64_t)&hwlldch->ch[channel].rd[i].transfer_size,
-			lli->transfer_size);
+			readl(&lli->transfer_size));
 		off += scnprintf(strbuf + off, size - off,
 				 "sar           : 0x%016llx 0x%016llx\n",
 				 (uint64_t)&hwlldch->ch[channel].rd[i].sar.reg,
-				 lli->sar.reg);
+				 readq(&lli->sar.reg));
 		off += scnprintf(strbuf + off, size - off,
 				 "dar           : 0x%016llx 0x%016llx\n",
 				 (uint64_t)&hwlldch->ch[channel].rd[i].dar.reg,
-				 lli->dar.reg);
+				 readq(&lli->dar.reg));
 	}
 
 out_rd_chx_ll:
@@ -446,18 +441,17 @@ axl_aipu_edma_debugfs_dbg_wr_chx_ll_write(struct file *file,
 	struct axl_pcie_aipu_dev *axldev = file->private_data;
 	volatile struct dw_edma_v0_regs *edma = axldev->dma;
 	volatile struct dw_edma_v0_lli *lli;
+	u32 llp_lo = readl(&edma->type.unroll.ch[channel].wr.llp.lsb);
+	u32 llp_hi = readl(&edma->type.unroll.ch[channel].wr.llp.msb);
 
-	if (edma->type.unroll.ch[channel].wr.llp.msb == 0 &&
-	    edma->type.unroll.ch[channel].wr.llp.lsb == 0) {
+	if (llp_hi == 0 && llp_lo == 0) {
 		dev_err(&axldev->pdev->dev,
 			"Linked List Pointer not configured\n");
 		return size;
 	}
-	lli = axldev->vbase +
-	      (((uint64_t)edma->type.unroll.ch[channel].wr.llp.msb << 32) +
-	       edma->type.unroll.ch[channel].wr.llp.lsb) -
+	lli = axldev->vbase + (((uint64_t)llp_hi << 32) + llp_lo) -
 	      EDMA_L2_BASE;
-	lli->control = 0;
+	writel(0, &lli->control);
 	dev_dbg(&axldev->pdev->dev, "Linked List Pointer reset\n");
 	return size;
 }
@@ -475,6 +469,7 @@ static ssize_t axl_aipu_edma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 	char *strbuf;
 	size_t size, ret, off = 0;
 	int i = 0;
+	u32 llp_lo, llp_hi;
 
 	size = max_t(size_t, count, 0x2000U);
 	dev_dbg(&axldev->pdev->dev, "WR:channel %d count %ld size %ld\n",
@@ -489,29 +484,24 @@ static ssize_t axl_aipu_edma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 				"Wrong channel %d [ 0- 3 ]\n", channel);
 		goto out_wr_chx_ll;
 	}
+	llp_lo = readl(&edma->type.unroll.ch[channel].wr.llp.lsb);
+	llp_hi = readl(&edma->type.unroll.ch[channel].wr.llp.msb);
 	off = scnprintf(strbuf + off, size - off,
 			"\n\n========= WR Channel %d ================\n",
 			channel);
 	off += scnprintf(strbuf + off, size - off, "llp         : 0x%08x%08x\n",
-			 edma->type.unroll.ch[channel].wr.llp.msb,
-			 edma->type.unroll.ch[channel].wr.llp.lsb);
-	if (edma->type.unroll.ch[channel].wr.llp.msb == 0 &&
-	    edma->type.unroll.ch[channel].wr.llp.lsb == 0) {
+			 llp_hi, llp_lo);
+	if (llp_hi == 0 && llp_lo == 0) {
 		off = scnprintf(strbuf + off, size - off,
 				"Linked List Pointer not configured\n");
 		goto out_wr_chx_ll;
 	}
 
-	hwlldch = (struct dw_edma_ll_buf
-			   *)((uint64_t)edma->type.unroll.ch[channel].wr.llp.msb
-				      << 32 |
-			      edma->type.unroll.ch[channel].wr.llp.lsb);
-	lli = axldev->vbase +
-	      (((uint64_t)edma->type.unroll.ch[channel].wr.llp.msb << 32) +
-	       edma->type.unroll.ch[channel].wr.llp.lsb) -
+	hwlldch = (struct dw_edma_ll_buf *)(((uint64_t)llp_hi << 32) | llp_lo);
+	lli = axldev->vbase + (((uint64_t)llp_hi << 32) + llp_lo) -
 	      EDMA_L2_BASE;
 
-	for (i = 0; (lli->control & (DW_EDMA_V0_CB | DW_EDMA_V0_TCB)) &&
+	for (i = 0; (readl(&lli->control) & (DW_EDMA_V0_CB | DW_EDMA_V0_TCB)) &&
 		    i < DW_EDMA_LL_NUM;
 	     i++, lli++) {
 		off += scnprintf(strbuf + off, size - off,
@@ -520,20 +510,20 @@ static ssize_t axl_aipu_edma_debugfs_dbg_wr_chx_ll_read(struct file *file,
 			strbuf + off, size - off,
 			"control       : 0x%016llx 0x%08x\n",
 			(uint64_t)(&hwlldch->ch[channel].wr[i].control),
-			lli->control);
+			readl(&lli->control));
 		off += scnprintf(
 			strbuf + off, size - off,
 			"transfer_size : 0x%016llx 0x%08x\n",
 			(uint64_t)&hwlldch->ch[channel].wr[i].transfer_size,
-			lli->transfer_size);
+			readl(&lli->transfer_size));
 		off += scnprintf(strbuf + off, size - off,
 				 "sar           : 0x%016llx 0x%016llx\n",
 				 (uint64_t)&hwlldch->ch[channel].wr[i].sar.reg,
-				 lli->sar.reg);
+				 readq(&lli->sar.reg));
 		off += scnprintf(strbuf + off, size - off,
 				 "dar           : 0x%016llx 0x%016llx\n",
 				 (uint64_t)&hwlldch->ch[channel].wr[i].dar.reg,
-				 lli->dar.reg);
+				 readq(&lli->dar.reg));
 	}
 
 out_wr_chx_ll:

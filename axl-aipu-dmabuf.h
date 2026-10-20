@@ -29,6 +29,8 @@ struct dmabuf_xfer {
 #define DMABUF_XFER_FLAG_WRITE 0x2
 #define DMABUF_XFER_FLAG_SYNC  0x4
 #define DMABUF_XFER_FLAG_ASYNC 0x8
+/* Poll the channel status instead of waiting for the completion irq */
+#define DMABUF_XFER_FLAG_POLL  0x10
 	int channel;
 };
 
@@ -82,6 +84,7 @@ struct dma_p2p_xfer {
 #define AXL_IOCTL_FWTRACE_ENABLE       _IOW(AXL_IOCTL_BASE, 23, uint32_t)
 #define AXL_IOCTL_FWTRACE_DISABLE      _IOW(AXL_IOCTL_BASE, 24, uint32_t)
 #define AXL_IOCTL_FWTRACE_CLEAR_BUFFER _IOW(AXL_IOCTL_BASE, 25, uint32_t)
+#define AXL_IOCTL_SEND_MSG	       _IOWR(AXL_IOCTL_BASE, 26, struct sysmsg *)
 #define AXL_IOCTL_GET_DMA_STATS	       _IOR(AXL_IOCTL_BASE, 32, struct dma_stats)
 #define AXL_IOCTL_GET_USER_PA	       _IOWR(AXL_IOCTL_BASE, 50, struct user_pa_req)
 
@@ -102,12 +105,49 @@ struct user_pa_req {
 	__u64 pa;
 };
 
-enum {
-	ASYNC_XFER_DONE = 1,
-	ASYNC_XFER_FAIL,
-	ASYNC_XFER_TIMEOUT,
-	ASYNC_XFER_PENDING,
+/* Must equal MAX_MSG in axl-aipu.h; asserted at build time. */
+#define AXL_SYSMSG_MAX_MSG 256
+
+/**
+ * struct sysmsg - One firmware system-message round trip
+ * @timeout: in. Seconds per firmware notification, not for the whole command.
+ *           0 selects the driver default.
+ * @status: out. Last device status seen, valid even on -ETIMEDOUT.
+ * @flags: in. Reserved, must be 0.
+ * @reserved: in. Must be 0.
+ * @opcode: in/out. Command; overwritten with the device status.
+ * @size: in/out. Meaningful bytes of @msg.
+ * @msg: in/out. Payload; overwritten with the reply, which on CMD_FAIL is the
+ *       firmware's error text.
+ *
+ * @opcode, @size and @msg mirror the device-side cmd_t layout. AXL_IOCTL_SEND_MSG
+ * returns 0 whenever the device answered - CMD_FAIL included - and reserves
+ * negative returns for transport failures.
+ */
+struct sysmsg {
+	__u32 timeout;
+	__u32 status;
+	__u32 flags;
+	__u32 reserved;
+	__u32 opcode;
+	__u32 size;
+	char msg[AXL_SYSMSG_MAX_MSG];
 };
+
+/*
+ * Transfer state reported by AXL_IOCTL_DMA_GET_XFER_ASYNC_STATUS.
+ */
+enum {
+	DMA_XFER_DONE = 1,
+	DMA_XFER_FAIL,
+	DMA_XFER_TIMEOUT,
+	DMA_XFER_PENDING,
+};
+
+#define ASYNC_XFER_DONE	   DMA_XFER_DONE
+#define ASYNC_XFER_FAIL	   DMA_XFER_FAIL
+#define ASYNC_XFER_TIMEOUT DMA_XFER_TIMEOUT
+#define ASYNC_XFER_PENDING DMA_XFER_PENDING
 #ifdef __KERNEL__
 struct dmabuf_imp {
 	struct dma_buf *dmabuf;

@@ -155,6 +155,9 @@ enum physical_msi {
 	PMSI_MAX = 32,
 };
 
+/* Command-mailbox notification slot; 12 on every generation. */
+#define AXL_SYSMSG_MSI PMSI_MSG
+
 enum vmsi_source {
 	VMSI_SOURCE_FW = 0, /* FW sets VMSI_IRQ_EN before triggering */
 	VMSI_SOURCE_HW = 1, /* HW triggers directly (1:1 PMSI-to-VMSI) */
@@ -169,7 +172,7 @@ struct vmsi_info_t {
 			uint16_t start;
 			uint16_t end;
 		} vmsi_range; /* VMSI_SOURCE_FW: scan this range for VMSI_IRQ_EN */
-		uint32_t pmsi_trigger; /* VMSI_SOURCE_HW: physical MSI index */
+		uint32_t vmsi_id; /* VMSI_SOURCE_HW: VMSI slot to signal/wait on */
 	};
 };
 
@@ -226,6 +229,15 @@ struct cmd_t {
 	uint32_t opcode;
 	uint32_t size;
 	char msg[MAX_MSG];
+};
+
+/* Values firmware leaves in cmd_t.opcode. From device_commands.h. */
+enum cmd_status {
+	CMD_IDLE = 0,
+	CMD_DONE = 1,
+	CMD_FAIL = 2,
+	CMD_UNSUPPORTED = 3,
+	CMD_UNKNOWN = 4,
 };
 
 struct version_t {
@@ -316,6 +328,19 @@ struct msi_info {
 	int num;
 	int timeout;
 };
+/*
+ * Single-MSI DMA handshake. The shared vector carries no source, so the handler
+ * visits every DMA slot on every interrupt and asks its check callback whether
+ * that channel terminated. A channel at rest can answer yes (HDMA ch_stat rests
+ * at STOPPED), so the check may only wake a slot that a waiter has ARMED, and
+ * the ARMED->DONE transition has to be atomic against the arming.
+ */
+enum dma_wait_state {
+	DMA_WAIT_IDLE = 0, /* no transfer in flight on this slot */
+	DMA_WAIT_ARMED, /* about to ring the doorbell, waiter blocking */
+	DMA_WAIT_DONE, /* check saw this channel transfer everything */
+	DMA_WAIT_ABORTED, /* check saw this channel abort */
+};
 struct irq_wrk {
 	struct axl_pcie_aipu_dev *axldev;
 	int id;
@@ -325,7 +350,7 @@ struct irq_wrk {
 	int (*check)(struct axl_pcie_aipu_dev *axldev, int id);
 	ktime_t stime;
 	struct list_head sctx_list;
-	atomic_t dma_done; /* Used in single-MSI mode to track DMA completion */
+	atomic_t dma_done; /* enum dma_wait_state, single-MSI mode only */
 };
 struct dma_wrk {
 	struct kref refcount;
@@ -344,6 +369,10 @@ struct dma_wrk {
 	int num_sgt;
 	int flags;
 	struct sg_table *table;
+	bool usr_dma;
+	struct page **page_list;
+	unsigned long nr_pages;
+	enum dma_data_direction dir; /* Logical transfer direction */
 	struct dma_queue_ctrl *qctrl;
 	ktime_t ktime; /* Request start time */
 	ktime_t ktime_wq; /* Workqueue start time */
@@ -366,6 +395,7 @@ struct dma_queue_ctrl {
 	size_t size;
 	ktime_t duration;
 	ktime_t max_duration;
+	int mode;
 };
 struct axl_dev_fops {
 	int (*dma_irq_ck)(struct axl_pcie_aipu_dev *axldev, int id);
@@ -381,6 +411,7 @@ struct axl_dev_fops {
 
 struct axl_msi_fops {
 	int (*init)(struct axl_pcie_aipu_dev *axldev);
+	void (*remap)(struct axl_pcie_aipu_dev *axldev);
 };
 #define MAX_MEMORY_AREA 2
 struct dev_res_info {
@@ -407,6 +438,7 @@ struct axl_pcie_aipu_dev {
 	struct pci_dev *pdev;
 	int dma_enabled : 1;
 	int dma_vm : 1;
+	int dma_poll_only : 1;
 	struct device_host_drv_t *hdrv_base;
 	dma_addr_t dma_addr;
 	dma_addr_t dma_addr_unaligned;
@@ -424,9 +456,13 @@ struct axl_pcie_aipu_dev {
 	struct dev_mem_window *mem_win;
 	int pes_group;
 	// vmsi stat
+	/* Host copy of the BAR-resident table; NULL until firmware publishes it */
 	struct device_vmsi_config_t *msi_cfg;
+	struct device_vmsi_config_t *msi_cfg_buf;
 	atomic_t *vmsi_count;
 	int max_msi;
+	// base DMA MSI id (DMA_RD_CH0)
+	int dma_msi_base;
 	// context
 	struct mutex mutex;
 	struct mutex msg_mutex;
@@ -442,6 +478,9 @@ struct axl_pcie_aipu_dev {
 	struct task_struct *recovery;
 	struct pci_saved_state *pcie_state;
 	int dev_state;
+	int restore_fails;
+	atomic_t dev_unreachable;
+	bool auto_recovery; // thread may start a restore on its own
 	// pcie dma
 	void *dma;
 	phys_addr_t pdma;
@@ -483,9 +522,9 @@ struct sysctrl_ctx {
 	struct kref refcount;
 	struct axl_pcie_aipu_dev *axldev;
 	uint64_t ctx_mask; // context mask
-	int msg_flag;
+	atomic_t msg_flag;
 	struct dmabuf_imp di;
-	atomic_t async_dma_xfer;
+	atomic_t dma_xfer_state;
 	struct dma_wrk *dma_wrk;
 	wait_queue_head_t poll_wait_queue;
 	atomic_t poll_event_cnt;
@@ -497,15 +536,12 @@ struct sysctrl_ctx {
 };
 
 /*
- * Record an async DMA transfer status on the owning sysctrl context.
- * The fwtrace consumer path issues DMA jobs with no sysctrl context
- * (dma_wrk->sctx == NULL), so callers in the DMA wait/error paths must
- * not dereference it unconditionally.
+ * Record a DMA transfer state (DMA_XFER_*) on the owning sysctrl context.
  */
-static inline void sctx_set_async_dma_xfer(struct sysctrl_ctx *sctx, int status)
+static inline void sctx_set_dma_xfer_state(struct sysctrl_ctx *sctx, int status)
 {
 	if (sctx)
-		atomic_set(&sctx->async_dma_xfer, status);
+		atomic_set(&sctx->dma_xfer_state, status);
 }
 
 struct dma_channel_stats {
@@ -617,6 +653,73 @@ static inline int axl_aipu_dma_irq_ck(struct axl_pcie_aipu_dev *axldev, int id)
 	return axldev->fops->dma_irq_ck(axldev, id);
 }
 
+static inline bool axl_aipu_has_vmsi_cfg(struct axl_pcie_aipu_dev *axldev)
+{
+	return axldev->msi_cfg != NULL;
+}
+
+/**
+ * dma_wait_arm() - Declare a transfer in flight on @id (see enum dma_wait_state)
+ * @axldev: Device context
+ * @id: MSI slot of the channel
+ *
+ * Arm last, after reinit_completion() and after the channel status has been
+ * cleared: a check callback already running against the previous transfer then
+ * has no armed slot to wake, and cannot hand its completion to this one.
+ */
+static inline void dma_wait_arm(struct axl_pcie_aipu_dev *axldev, int id)
+{
+	atomic_set(&axldev->irq_wrk[id].dma_done, DMA_WAIT_ARMED);
+}
+
+/**
+ * dma_wait_is_armed() - Is a transfer in flight on @id?
+ * @axldev: Device context
+ * @id: MSI slot of the channel
+ *
+ * Test this before reading a channel status register: dma_wait_arm() runs after
+ * the status has been cleared, so a status read that follows an armed reading
+ * cannot be describing the previous transfer.
+ */
+static inline bool dma_wait_is_armed(struct axl_pcie_aipu_dev *axldev, int id)
+{
+	return atomic_read(&axldev->irq_wrk[id].dma_done) == DMA_WAIT_ARMED;
+}
+
+/**
+ * dma_wait_claim() - Take ownership of the wake for @id, from a check callback
+ * @axldev: Device context
+ * @id: MSI slot of the channel
+ * @outcome: DMA_WAIT_DONE or DMA_WAIT_ABORTED, how the transfer ended
+ *
+ * The outcome is recorded here because the channel status register is not stable
+ * afterwards: a linked-list channel returns to RUNNING once it resumes polling
+ * the next descriptor, so the waiter cannot re-read what happened.
+ *
+ * Return: true if @id was armed and now holds @outcome - the caller may complete
+ * the waiter; false if no transfer is in flight, in which case the terminated
+ * status the caller read belongs to a channel at rest and means nothing.
+ */
+static inline bool dma_wait_claim(struct axl_pcie_aipu_dev *axldev, int id,
+				  int outcome)
+{
+	return atomic_cmpxchg(&axldev->irq_wrk[id].dma_done, DMA_WAIT_ARMED,
+			      outcome) == DMA_WAIT_ARMED;
+}
+
+/**
+ * dma_wait_consume() - Disarm @id and report how the wait ended
+ * @axldev: Device context
+ * @id: MSI slot of the channel
+ *
+ * Return: DMA_WAIT_DONE if a check callback claimed this transfer, otherwise
+ * the slot was woken by something else (or timed out).
+ */
+static inline int dma_wait_consume(struct axl_pcie_aipu_dev *axldev, int id)
+{
+	return atomic_xchg(&axldev->irq_wrk[id].dma_done, DMA_WAIT_IDLE);
+}
+
 static inline void axl_aipu_dev_dynmem_init(struct axl_pcie_aipu_dev *axldev)
 {
 	if (axldev->fops->dev_dynmem_init)
@@ -647,6 +750,18 @@ static inline int get_timeout_ms(int timeout)
 }
 
 extern unsigned int dma_timeout;
+extern unsigned int dma_poll;
+
+/*
+ * dma_poll module param is an override: it forces every transfer to poll.
+ * dma_poll_only is the same thing decided per device, for a generation and MSI
+ * mode whose DMA completion interrupts are not usable (see axl_pci_msi_init()).
+ */
+static inline bool dma_poll_mode(struct dma_wrk *dma_wrk)
+{
+	return dma_poll || dma_wrk->axldev->dma_poll_only ||
+	       (dma_wrk->flags & DMABUF_XFER_FLAG_POLL);
+}
 
 static inline int
 axl_aipu_find_free_dma_channel(struct axl_pcie_aipu_dev *axldev, int flags)
@@ -685,6 +800,27 @@ static inline int validate_dma_xfer(struct dmabuf_xfer *dxfer,
 	    ((dxfer->flags & async_sync) == async_sync))
 		return -EINVAL;
 	if (dxfer->size == 0)
+		return -EINVAL;
+	return 0;
+}
+
+static inline int validate_usr_dma_xfer(struct dma_xfer *xfer,
+					struct pci_dev *pdev)
+{
+	int read_write = DMABUF_XFER_FLAG_READ | DMABUF_XFER_FLAG_WRITE;
+	int async_sync = DMABUF_XFER_FLAG_ASYNC | DMABUF_XFER_FLAG_SYNC;
+
+	dev_dbg(&pdev->dev,
+		"usr dma xfer %s | phy 0x%llx | virt 0x%llx | size 0x%zx | flags 0x%x\n",
+		xfer->flags & DMABUF_XFER_FLAG_READ ? "RD" : "WR", xfer->phy,
+		xfer->virt, xfer->size, xfer->flags);
+
+	if (xfer->size == 0)
+		return -EINVAL;
+	if (((xfer->flags & read_write) == 0) ||
+	    ((xfer->flags & read_write) == read_write))
+		return -EINVAL;
+	if ((xfer->flags & async_sync) == async_sync)
 		return -EINVAL;
 	return 0;
 }
@@ -729,12 +865,37 @@ static inline void vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
 #endif
 
 long sysctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+int axl_aipu_send_msg(struct axl_pcie_aipu_dev *axldev, struct cmd_t *cmd,
+		      unsigned int timeout, u32 *status);
 void axl_aipu_sys_ctx_release(struct kref *kref);
 void axl_aipu_dma_wrk_release(struct kref *kref);
+void axl_aipu_sys_ctx_cleanup_dmabuf(struct sysctrl_ctx *sys_ctx);
 
 void axl_aipu_config_dev_dma(struct axl_pcie_aipu_dev *axldev);
 void axl_aipu_config_dev_msi(struct axl_pcie_aipu_dev *axldev);
 void axl_aipu_dma_imwr_restore(struct axl_pcie_aipu_dev *axldev);
+
+void axl_aipu_dev_problem(struct axl_pcie_aipu_dev *axldev, const char *reason);
+
+static inline int axl_aipu_dma_dev_gone(struct axl_pcie_aipu_dev *axldev,
+					struct dma_wrk *dma_wrk)
+{
+	struct pci_dev *pdev = axldev->pdev;
+	const char *mode = dma_wrk->flags & DMABUF_XFER_FLAG_READ ? "WR" : "RD";
+
+	dev_err(&pdev->dev, "DMA %s CH%d device not responding (irq %d)\n",
+		mode, dma_wrk->channel, dma_wrk->id);
+	axl_aipu_dev_problem(axldev, "DMA register read");
+	dma_wrk->status = -EIO;
+	sctx_set_dma_xfer_state(dma_wrk->sctx, DMA_XFER_FAIL);
+	dma_wrk->qctrl->num_err++;
+	return -1;
+}
+
+static inline bool axl_aipu_dev_is_unreachable(struct axl_pcie_aipu_dev *axldev)
+{
+	return atomic_read(&axldev->dev_unreachable) != 0;
+}
 
 #endif // __KERNEL__
 
